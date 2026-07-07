@@ -35,18 +35,18 @@ sudo upgrade_docker --search-dir /srv
 
 | Option | Description | Défaut |
 |---|---|---|
-| `--dry-run` | Vérifie les mises à jour sans rien modifier | — |
+| `--dry-run` | Vérifie les mises à jour sans rien modifier | - |
 | `--parallel N` | Jobs simultanés | 20 |
 | `--timeout N` | Timeout en secondes par pull | 300 |
 | `--search-dir DIR` | Répertoire à scanner (répétable) | `/opt /home /docker_data` |
-| `--no-prune` | Ne pas supprimer les images obsolètes | — |
-| `--compose-only` | Traite uniquement les stacks Compose | — |
-| `--standalone-only` | Traite uniquement les images standalone | — |
-| `--force` | Force le re-pull de toutes les images (sans recréer les conteneurs si digest inchangé) | — |
-| `--force-reboot` | Recrée les conteneurs même si le digest n'a pas changé | — |
-| `--exclude IMAGE` | Exclut une image (répétable) | — |
-| `--image IMAGE` | Traite uniquement cette image | — |
-| `--notify EMAIL` | Envoie un mail en cas d'échec (nécessite `mail`) | — |
+| `--no-prune` | Ne pas supprimer les images obsolètes | - |
+| `--compose-only` | Traite uniquement les stacks Compose | - |
+| `--standalone-only` | Traite uniquement les images standalone | - |
+| `--force` | Force le re-pull de toutes les images (sans recréer les conteneurs si digest inchangé) | - |
+| `--force-reboot` | Recrée les conteneurs même si le digest n'a pas changé | - |
+| `--exclude IMAGE` | Exclut une image (répétable) | - |
+| `--image IMAGE` | Traite uniquement cette image | - |
+| `--notify EMAIL` | Envoie un mail en cas d'échec (nécessite `mail`) | - |
 | `--log FILE` | Fichier de log | `/var/log/docker-update.log` |
 
 ## Fonctionnement
