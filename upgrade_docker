@@ -60,7 +60,8 @@ Options:
   --no-prune                 Ne pas supprimer les images obsolètes
   --compose-only             Traite uniquement les stacks Compose
   --standalone-only          Traite uniquement les images standalone
-  --force                    Force le re-pull de toutes les images (sans recréer les conteneurs si digest inchangé)
+  --force                    Traite aussi les images déjà à jour (effet visible en --dry-run :
+                             elles sont signalées [FORCE] ; en mode normal tout est déjà pullé)
   --force-reboot             Recrée les conteneurs même si le digest n'a pas changé
   --exclude IMAGE            Exclut une image (répétable)
   --image IMAGE              Traite uniquement cette image
@@ -350,76 +351,158 @@ estimate_prune_size() {
 # MODE NORMAL : pull + récréation de conteneur
 # =============================================================================
 
-# Recrée un conteneur depuis son inspect après un pull
+# Recrée un conteneur à l'identique depuis son inspect, après un pull.
+#
+# Deux principes :
+#  - on ne réinjecte que ce qui DIFFÈRE de l'image (env, labels, cmd, entrypoint) :
+#    réinjecter les défauts de l'image figerait l'ancienne version et annulerait la MAJ ;
+#  - l'ancien conteneur est RENOMMÉ (pas supprimé) : si le run échoue, on le restaure.
 recreate_container() {
     local name="$1"
     local image="$2"
+    local c img x
+    c=$(docker inspect "$name" 2>/dev/null)     || { warn "inspect echoue pour $name"; return 1; }
+    img=$(docker inspect "$image" 2>/dev/null)  || img='[{}]'
 
-    local inspect
-    inspect=$(docker inspect "$name" 2>/dev/null) || { warn "inspect échoué pour $name"; return 1; }
+    local -a args=(-d --name "$name")
 
-    local restart_policy
-    restart_policy=$(echo "$inspect" | jq -r '.[0].HostConfig.RestartPolicy.Name // "no"')
+    # Restart policy
+    local rp rc
+    rp=$(jq -r '.[0].HostConfig.RestartPolicy.Name // ""'             <<<"$c")
+    rc=$(jq -r '.[0].HostConfig.RestartPolicy.MaximumRetryCount // 0' <<<"$c")
+    if   [[ "$rp" == "on-failure" && "$rc" -gt 0 ]]; then args+=(--restart "on-failure:$rc")
+    elif [[ -n "$rp" && "$rp" != "no" ]];           then args+=(--restart "$rp")
+    fi
 
-    docker stop "$name" >/dev/null 2>&1 || true
-    docker rm   "$name" >/dev/null 2>&1 || true
-
-    local run_args=("--name" "$name" "--restart" "$restart_policy" "-d")
-
-    # Réseau(x)
-    local first_net=true
-    while IFS= read -r net; do
-        [[ -z "$net" ]] && continue
-        if $first_net; then run_args+=("--network" "$net"); first_net=false
-        else               run_args+=("--network" "$net")
-        fi
-    done < <(echo "$inspect" | jq -r '.[0].NetworkSettings.Networks | keys[]' 2>/dev/null)
-
-    # Ports
-    while IFS= read -r port_line; do
-        [[ -z "$port_line" ]] && continue
-        run_args+=("-p" "$port_line")
-    done < <(echo "$inspect" | jq -r '
-        .[0].HostConfig.PortBindings // {} | to_entries[] |
-        .key as $cp | .value[]? |
-        (if .HostIp != "" and .HostIp != "0.0.0.0" then .HostIp + ":" else "" end) +
-        .HostPort + ":" + ($cp | split("/")[0])
-    ' 2>/dev/null)
-
-    # Volumes (bind mounts)
-    while IFS= read -r vol; do
-        [[ -z "$vol" ]] && continue
-        run_args+=("-v" "$vol")
-    done < <(echo "$inspect" | jq -r '.[0].HostConfig.Binds // [] | .[]' 2>/dev/null)
-
-    # Variables d'env (filtre les variables injectées par Docker)
-    while IFS= read -r env_var; do
-        [[ -z "$env_var" ]] && continue
-        case "$env_var" in PATH=*|HOME=*|HOSTNAME=*) continue ;; esac
-        run_args+=("-e" "$env_var")
-    done < <(echo "$inspect" | jq -r '.[0].Config.Env // [] | .[]' 2>/dev/null)
-
-    run_args+=("$image")
-
-    if docker run "${run_args[@]}" >/dev/null 2>&1; then
-        return 0
+    # Réseaux : mode special (container:xxx = partage la stack d'un autre conteneur, ex. VPN/gluetun)
+    # sinon le premier reseau a la creation, les suivants connectes apres le run.
+    local -a nets=()
+    local netmode
+    netmode=$(jq -r '.[0].HostConfig.NetworkMode // ""' <<<"$c" 2>/dev/null)
+    if [[ "$netmode" == container:* ]]; then
+        args+=(--network "$netmode")
     else
-        warn "Recreation de $name echouee — vérifiez avec: docker inspect $name"
+        while IFS= read -r x; do [[ -n "$x" ]] && nets+=("$x"); done \
+            < <(jq -r '.[0].NetworkSettings.Networks | keys[]?' <<<"$c" 2>/dev/null)
+        [[ ${#nets[@]} -gt 0 ]] && args+=(--network "${nets[0]}")
+    fi
+
+    # Ports publiés (udp inclus)
+    while IFS= read -r x; do [[ -n "$x" ]] && args+=(-p "$x"); done < <(jq -r '
+        .[0].HostConfig.PortBindings // {} | to_entries[] | .key as $cp | .value[]? |
+        ((if (.HostIp // "") != "" and .HostIp != "0.0.0.0" then .HostIp + ":" else "" end)
+         + (.HostPort // "") + ":" + ($cp | split("/")[0])
+         + (if ($cp | test("/udp$")) then "/udp" else "" end))' <<<"$c" 2>/dev/null)
+
+    # Volumes : .Mounts couvre binds ET volumes nommés (y compris ceux créés via --mount)
+    while IFS= read -r x; do [[ -n "$x" ]] && args+=(-v "$x"); done < <(jq -r '
+        .[0].Mounts // [] | .[] |
+        if   .Type == "bind"   then .Source + ":" + .Destination + (if .RW then "" else ":ro" end)
+        elif .Type == "volume" then (.Name // .Source) + ":" + .Destination + (if .RW then "" else ":ro" end)
+        else empty end' <<<"$c" 2>/dev/null)
+    while IFS= read -r x; do [[ -n "$x" ]] && args+=(--tmpfs "$x"); done \
+        < <(jq -r '.[0].HostConfig.Tmpfs // {} | keys[]?' <<<"$c" 2>/dev/null)
+
+    # Env : seulement celles absentes de l'image (sinon on fige les défauts de l'ancienne version)
+    while IFS= read -r x; do [[ -n "$x" ]] && args+=(-e "$x"); done < <(jq -r --argjson ie "$(jq '.[0].Config.Env // []' <<<"$img")" '
+        .[0].Config.Env // [] | .[] | select(. as $e | ($ie | index($e)) == null)' <<<"$c" 2>/dev/null)
+
+    # Labels : seulement ceux qui diffèrent de l'image (Traefik & co — critiques !)
+    while IFS= read -r x; do [[ -n "$x" ]] && args+=(-l "$x"); done < <(jq -r --argjson il "$(jq '.[0].Config.Labels // {}' <<<"$img")" '
+        .[0].Config.Labels // {} | to_entries[] | select(.value != ($il[.key] // null)) | .key + "=" + .value' <<<"$c" 2>/dev/null)
+
+    # Identité / TTY / privilèges
+    x=$(jq -r '.[0].Config.User // ""' <<<"$c");  [[ -n "$x" ]] && args+=(-u "$x")
+    x=$(jq -r '.[0].Config.WorkingDir // ""' <<<"$c")
+    [[ -n "$x" && "$x" != "$(jq -r '.[0].Config.WorkingDir // ""' <<<"$img")" ]] && args+=(-w "$x")
+    [[ "$(jq -r '.[0].Config.Tty' <<<"$c")"            == "true" ]] && args+=(-t)
+    [[ "$(jq -r '.[0].Config.OpenStdin' <<<"$c")"      == "true" ]] && args+=(-i)
+    [[ "$(jq -r '.[0].HostConfig.Privileged' <<<"$c")" == "true" ]] && args+=(--privileged)
+
+    # Limites de ressources
+    x=$(jq -r '.[0].HostConfig.Memory // 0' <<<"$c");    (( x > 0 )) && args+=(--memory "$x")
+    x=$(jq -r '.[0].HostConfig.PidsLimit // 0' <<<"$c"); (( x > 0 )) && args+=(--pids-limit "$x")
+    x=$(jq -r '.[0].HostConfig.NanoCpus // 0' <<<"$c")
+    (( x > 0 )) && args+=(--cpus "$(awk -v n="$x" 'BEGIN{printf "%.3f", n/1000000000}')")
+
+    # Capacités, devices, hosts, dns, log driver
+    while IFS= read -r x; do [[ -n "$x" ]] && args+=(--cap-add  "$x"); done < <(jq -r '.[0].HostConfig.CapAdd  // [] | .[]?' <<<"$c" 2>/dev/null)
+    while IFS= read -r x; do [[ -n "$x" ]] && args+=(--cap-drop "$x"); done < <(jq -r '.[0].HostConfig.CapDrop // [] | .[]?' <<<"$c" 2>/dev/null)
+    while IFS= read -r x; do [[ -n "$x" ]] && args+=(--device   "$x"); done \
+        < <(jq -r '.[0].HostConfig.Devices // [] | .[]? | .PathOnHost + ":" + .PathInContainer + ":" + .CgroupPermissions' <<<"$c" 2>/dev/null)
+    while IFS= read -r x; do [[ -n "$x" ]] && args+=(--add-host "$x"); done < <(jq -r '.[0].HostConfig.ExtraHosts // [] | .[]?' <<<"$c" 2>/dev/null)
+    while IFS= read -r x; do [[ -n "$x" ]] && args+=(--dns      "$x"); done < <(jq -r '.[0].HostConfig.Dns // [] | .[]?' <<<"$c" 2>/dev/null)
+    x=$(jq -r '.[0].HostConfig.LogConfig.Type // ""' <<<"$c")
+    [[ -n "$x" && "$x" != "json-file" ]] && args+=(--log-driver "$x")
+
+    # Entrypoint personnalisé (seulement s'il diffère de l'image)
+    local c_ep i_ep
+    c_ep=$(jq -c '.[0].Config.Entrypoint // []' <<<"$c"); i_ep=$(jq -c '.[0].Config.Entrypoint // []' <<<"$img")
+    if [[ "$c_ep" != "$i_ep" ]]; then
+        if [[ "$(jq 'length' <<<"$c_ep")" == "1" ]]; then args+=(--entrypoint "$(jq -r '.[0]' <<<"$c_ep")")
+        else warn "$name : entrypoint personnalise multi-arguments non reproduit ($c_ep)"
+        fi
+    fi
+
+    args+=("$image")
+
+    # Commande personnalisée (seulement si elle diffère de l'image)
+    local c_cmd i_cmd
+    c_cmd=$(jq -c '.[0].Config.Cmd // []' <<<"$c"); i_cmd=$(jq -c '.[0].Config.Cmd // []' <<<"$img")
+    if [[ "$c_cmd" != "$i_cmd" && "$c_cmd" != "[]" && "$c_cmd" != "null" ]]; then
+        while IFS= read -r x; do args+=("$x"); done < <(jq -r '.[]?' <<<"$c_cmd" 2>/dev/null)
+    fi
+
+    # Ce qu'on ne sait pas reproduire : on prévient au lieu de faire semblant
+    [[ "$(jq '((.[0].HostConfig.Ulimits // []) | length) + ((.[0].HostConfig.Sysctls // {}) | length) + ((.[0].HostConfig.DeviceRequests // []) | length)' <<<"$c" 2>/dev/null)" != "0" ]] \
+        && warn "$name : ulimits/sysctls/GPU detectes — NON reproduits par la recreation"
+    [[ "$(jq '[.[0].NetworkSettings.Networks[]? | select(((.Aliases // []) | length) > 0 or (.IPAMConfig // null) != null)] | length' <<<"$c" 2>/dev/null)" != "0" ]] \
+        && warn "$name : alias reseau / IP statique detectes — NON reproduits"
+
+    # --- Bascule sécurisée : on renomme l'ancien, on lance le neuf, rollback si echec ---
+    local old="${name}__old_$$"
+    docker stop "$name" >/dev/null 2>&1 || true
+    if ! docker rename "$name" "$old" >/dev/null 2>&1; then
+        warn "$name : rename impossible — recreation abandonnee (conteneur intact)"
+        docker start "$name" >/dev/null 2>&1 || true
         return 1
     fi
+
+    if docker run "${args[@]}" >/dev/null 2>&1; then
+        docker rm "$old" >/dev/null 2>&1 || true
+        local k
+        for (( k=1; k<${#nets[@]}; k++ )); do
+            docker network connect "${nets[k]}" "$name" >/dev/null 2>&1 \
+                || warn "$name : connexion au reseau ${nets[k]} echouee"
+        done
+        return 0
+    fi
+
+    # Echec : on restaure l'ancien conteneur
+    err "Recreation de $name echouee — restauration de l'ancien conteneur"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    if docker rename "$old" "$name" >/dev/null 2>&1; then
+        docker start "$name" >/dev/null 2>&1 && log "   [ROLLBACK] $name restaure sur l'ancienne image"
+    else
+        err "$name : rollback impossible ! Ancien conteneur conserve sous le nom $old"
+    fi
+    return 1
 }
 export -f recreate_container
 
 pull_and_restart() {
     local image="$1"
-    local force_pull="$2"
-    local force_reboot="$3"
-    local timeout_val="$4"
+    local force_reboot="$2"
+    local timeout_val="$3"
 
     local digest_before
     digest_before=$(docker inspect --format='{{index .RepoDigests 0}}' "$image" 2>/dev/null || echo "none")
 
-    # Avec --force, on force le pull même si à jour (--pull=always n'existe pas en standalone)
+    # IMPORTANT : lister les conteneurs AVANT le pull. Apres le pull, le tag pointe sur la
+    # nouvelle image et 'ancestor=' ne retrouve plus les conteneurs (restes sur l'ancienne).
+    local containers
+    containers=$(docker ps --filter "ancestor=$image" --format "{{.Names}}" | tr '\n' ' ')
+
     if ! timeout "$timeout_val" docker pull "$image" >/dev/null 2>&1; then
         echo "PULL_FAILED $image"; return
     fi
@@ -428,8 +511,6 @@ pull_and_restart() {
     digest_after=$(docker inspect --format='{{index .RepoDigests 0}}' "$image" 2>/dev/null || echo "none")
 
     if [[ "$digest_before" != "$digest_after" || "$force_reboot" == "true" ]]; then
-        local containers
-        containers=$(docker ps --filter "ancestor=$image" --format "{{.Names}}" | tr '\n' ' ')
         if [[ -n "${containers// }" ]]; then
             echo "UPDATED $image $containers"
         else
@@ -644,7 +725,7 @@ if ! $COMPOSE_ONLY; then
         if [[ ${#standalone_images[@]} -gt 0 ]]; then
             tmpfile=$(mktemp); _TMPFILES+=("$tmpfile")
 
-            printf '%s\n' "${standalone_images[@]}" | xargs -P"$PARALLEL" -I{} bash -c 'pull_and_restart "$@"' _ {} "$FORCE_PULL" "$FORCE_REBOOT" "$PULL_TIMEOUT" > "$tmpfile"
+            printf '%s\n' "${standalone_images[@]}" | xargs -P"$PARALLEL" -I{} bash -c 'pull_and_restart "$@"' _ {} "$FORCE_REBOOT" "$PULL_TIMEOUT" > "$tmpfile"
 
             while IFS= read -r line; do
                 read -r status image rest <<< "$line"

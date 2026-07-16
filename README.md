@@ -22,7 +22,7 @@ sudo upgrade_docker
 sudo upgrade_docker --parallel 5
 sudo upgrade_docker --image nginx:latest
 sudo upgrade_docker --exclude redis:7
-sudo upgrade_docker --force          # Re-pull toutes les images (sans recréer les conteneurs si digest inchangé)
+sudo upgrade_docker --force          # Traite aussi les images déjà à jour (visible en --dry-run)
 sudo upgrade_docker --force-reboot   # Recrée les conteneurs même si le digest n'a pas changé
 sudo upgrade_docker --compose-only
 sudo upgrade_docker --standalone-only
@@ -42,7 +42,7 @@ sudo upgrade_docker --search-dir /srv
 | `--no-prune` | Ne pas supprimer les images obsolètes | - |
 | `--compose-only` | Traite uniquement les stacks Compose | - |
 | `--standalone-only` | Traite uniquement les images standalone | - |
-| `--force` | Force le re-pull de toutes les images (sans recréer les conteneurs si digest inchangé) | - |
+| `--force` | Traite aussi les images déjà à jour — effet visible en `--dry-run` (signalées `[FORCE]`) ; en mode normal toutes les images sont déjà pullées | - |
 | `--force-reboot` | Recrée les conteneurs même si le digest n'a pas changé | - |
 | `--exclude IMAGE` | Exclut une image (répétable) | - |
 | `--image IMAGE` | Traite uniquement cette image | - |
