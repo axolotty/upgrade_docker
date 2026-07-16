@@ -27,6 +27,7 @@ sudo upgrade_docker --force-reboot   # Recrée les conteneurs même si le digest
 sudo upgrade_docker --compose-only
 sudo upgrade_docker --standalone-only
 sudo upgrade_docker --no-prune
+sudo upgrade_docker --no-build       # ne pas reconstruire les images construites localement
 sudo upgrade_docker --notify admin@example.com
 sudo upgrade_docker --search-dir /srv
 ```
@@ -40,6 +41,7 @@ sudo upgrade_docker --search-dir /srv
 | `--timeout N` | Timeout en secondes par pull | 300 |
 | `--search-dir DIR` | Répertoire à scanner (répétable) | `/opt /home /docker_data` |
 | `--no-prune` | Ne pas supprimer les images obsolètes | - |
+| `--no-build` | Ne pas reconstruire les services Compose avec `build:` (par défaut : base re-pullée + image reconstruite) | - |
 | `--compose-only` | Traite uniquement les stacks Compose | - |
 | `--standalone-only` | Traite uniquement les images standalone | - |
 | `--force` | Traite aussi les images déjà à jour — effet visible en `--dry-run` (signalées `[FORCE]`) ; en mode normal toutes les images sont déjà pullées | - |
@@ -54,7 +56,8 @@ sudo upgrade_docker --search-dir /srv
 ### Stacks Docker Compose
 - Scanne les répertoires configurés à la recherche de `docker-compose.yml` / `docker-compose.yaml`
 - Exclut `vendor/`, `node_modules/`, `html/apps/`, `.git/`
-- En mode normal : `docker compose pull` + `docker compose up -d --remove-orphans`
+- **Services avec `build:`** (image construite depuis un `Dockerfile`) : `docker compose build --pull` → **retélécharge l'image de base** puis **reconstruit** l'image. Sans ça, une image construite localement n'est jamais mise à jour et sa base vieillit indéfiniment. Désactivable avec `--no-build`.
+- Puis `docker compose pull --ignore-buildable` + `docker compose up -d --remove-orphans`
 - Avec `--force-reboot` : `docker compose up -d --force-recreate`
 
 ### Images standalone
@@ -70,7 +73,8 @@ sudo upgrade_docker --search-dir /srv
 - Vérifie les digests distants via l'API registry (sans pull)
 - Calcule la taille réelle des layers à télécharger
 - Estime l'espace libéré après prune
-- Labels : `[OK]` à jour · `[UPDATE]` mise à jour disponible · `[FORCE]` forcé mais déjà à jour · `[LOCAL]` image locale
+- Pour les services `build:` : lit les `FROM` du Dockerfile et vérifie l'**image de base** (les stages multi-étapes, `FROM $ARG` et `scratch` sont ignorés)
+- Labels : `[OK]` à jour · `[UPDATE]` mise à jour disponible · `[FORCE]` forcé mais déjà à jour · `[LOCAL]` image locale · `[BUILD]` service construit localement (base vérifiée)
 
 ## Limites connues (images standalone)
 

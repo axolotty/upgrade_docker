@@ -18,6 +18,7 @@ PARALLEL=20
 SEARCH_DIRS=()
 DRY_RUN=false
 NO_PRUNE=false
+NO_BUILD=false          # --no-build     : ne pas reconstruire les services Compose 'build:'
 COMPOSE_ONLY=false
 STANDALONE_ONLY=false
 FORCE_PULL=false        # --force        : retélécharge toutes les images
@@ -58,6 +59,8 @@ Options:
   --timeout N                Timeout en secondes par pull          [défaut: $PULL_TIMEOUT]
   --search-dir DIR           Répertoire à scanner (répétable)      [défaut: /opt /home /docker_data]
   --no-prune                 Ne pas supprimer les images obsolètes
+  --no-build                 Ne pas reconstruire les services Compose avec 'build:'
+                             (par défaut : image de base re-pullée + image reconstruite)
   --compose-only             Traite uniquement les stacks Compose
   --standalone-only          Traite uniquement les images standalone
   --force                    Traite aussi les images déjà à jour (effet visible en --dry-run :
@@ -84,6 +87,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --dry-run)          DRY_RUN=true ;;
         --no-prune)         NO_PRUNE=true ;;
+        --no-build)         NO_BUILD=true ;;
         --compose-only)     COMPOSE_ONLY=true ;;
         --standalone-only)  STANDALONE_ONLY=true ;;
         --force)            FORCE_PULL=true ;;
@@ -157,6 +161,10 @@ check_requirements() {
     fi
     ! docker manifest inspect --help &>/dev/null 2>&1 && export DOCKER_CLI_EXPERIMENTAL=enabled
     [[ $EUID -ne 0 ]] && warn "Non exécuté en root — certaines opérations peuvent échouer"
+    # 'compose pull' sort en erreur sur les services buildables : on l'ignore si l'option existe
+    _PULL_OPTS=()
+    docker compose pull --help 2>&1 | grep -q -- '--ignore-buildable' && _PULL_OPTS=(--ignore-buildable)
+    return 0
 }
 
 # --- Dry-run wrapper ---------------------------------------------------------
@@ -345,6 +353,29 @@ estimate_prune_size() {
         { total += to_bytes($1) }
         END { print total+0 }
     '
+}
+
+# --- Stacks qui construisent leurs images (build:) -----------------------------
+# "service|contexte|dockerfile" pour chaque service Compose qui construit son image.
+_compose_build_services() {
+    docker compose -f "$1" config --format json 2>/dev/null \
+        | jq -r '.services | to_entries[] | select(.value.build != null)
+                 | .key + "|" + (.value.build.context // ".") + "|" + (.value.build.dockerfile // "Dockerfile")' 2>/dev/null
+}
+
+# Images de base (FROM) d'un Dockerfile : ignore les stages multi-étapes, les ARG et scratch.
+_dockerfile_bases() {
+    [[ -f "$1" ]] || return 0
+    awk '
+        tolower($1) == "from" {
+            img = $2
+            if (tolower($3) == "as") stages[tolower($4)] = 1
+            if (tolower(img) in stages) next     # FROM <stage precedent>
+            if (img ~ /\$/)             next     # FROM ${ARG} : non resolvable
+            if (tolower(img) == "scratch") next
+            print img
+        }
+    ' "$1" | sort -u
 }
 
 # =============================================================================
@@ -693,9 +724,44 @@ if ! $STANDALONE_ONLY; then
             fi
         done < <(docker compose -f "$composefile" config --images 2>/dev/null || true)
 
-        $DRY_RUN && continue
+        # Services qui CONSTRUISENT leur image : la base doit être re-pullée puis l'image rebuild
+        _builds=()
+        while IFS= read -r _bs; do [[ -n "$_bs" ]] && _builds+=("$_bs"); done \
+            < <(_compose_build_services "$composefile")
 
-        if (cd "$dir" && docker compose pull 2>&1 | sed 's/^/   /'); then
+        if $DRY_RUN; then
+            # En dry-run : on vérifie les images de BASE des Dockerfile (FROM ...)
+            for _bs in "${_builds[@]+"${_builds[@]}"}"; do
+                IFS='|' read -r _svc _ctx _df <<< "$_bs"
+                [[ "$_df" != /* ]] && _df="$_ctx/$_df"
+                while IFS= read -r _base; do
+                    [[ -z "$_base" ]] && continue
+                    is_excluded "$_base" && continue
+                    [[ "$_base" == *:* ]] || _base="${_base}:latest"
+                    log "   [BUILD] $_svc — image de base : $_base"
+                    [[ -v _dry_checked["$_base"] ]] && continue
+                    _dry_checked["$_base"]=1
+                    _compose_dry_list+=("$_base")
+                done < <(_dockerfile_bases "$_df")
+            done
+            continue
+        fi
+
+        # Reconstruction avant le pull : 'build --pull' retélécharge l'image de base puis rebuild
+        if [[ ${#_builds[@]} -gt 0 ]]; then
+            if $NO_BUILD; then
+                log "   [BUILD] ${#_builds[@]} service(s) buildable(s) — ignore (--no-build)"
+            else
+                log "   [BUILD] Reconstruction de ${#_builds[@]} service(s) (re-pull de l'image de base)"
+                if ! (cd "$dir" && docker compose build --pull 2>&1 | sed 's/^/   /'); then
+                    warn "Echec du 'build --pull' pour $dir"
+                    FAILED_IMAGES+=("compose-build:$dir")
+                fi
+            fi
+        fi
+
+        # --ignore-buildable : sans ça, 'pull' sort en erreur sur les services build: (stack vue en echec)
+        if (cd "$dir" && docker compose pull "${_PULL_OPTS[@]+"${_PULL_OPTS[@]}"}" 2>&1 | sed 's/^/   /'); then
             if (cd "$dir" && docker compose up -d --remove-orphans 2>&1 | sed 's/^/   /'); then
                 log "   [OK] Stack demarree"
                 if $FORCE_REBOOT; then
