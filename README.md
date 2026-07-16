@@ -30,6 +30,7 @@ sudo upgrade_docker --no-prune
 sudo upgrade_docker --no-build       # ne pas reconstruire les images construites localement
 sudo upgrade_docker --notify admin@example.com
 sudo upgrade_docker --search-dir /srv
+sudo upgrade_docker --exclude-dir BACKUP   # ignorer aussi les dossiers BACKUP/
 ```
 
 ## Options
@@ -40,6 +41,7 @@ sudo upgrade_docker --search-dir /srv
 | `--parallel N` | Jobs simultanés | 20 |
 | `--timeout N` | Timeout en secondes par pull | 300 |
 | `--search-dir DIR` | Répertoire à scanner (répétable) | `/opt /home /docker_data` |
+| `--exclude-dir NOM` | Dossier à ignorer au scan (répétable) — s'ajoute aux exclusions par défaut (`vendor`, `node_modules`, `html/apps`, `.git`, `OLD`) | - |
 | `--no-prune` | Ne pas supprimer les images obsolètes | - |
 | `--no-build` | Ne pas reconstruire les services Compose avec `build:` (par défaut : reconstruit **uniquement si l'image de base a une MAJ**) | - |
 | `--compose-only` | Traite uniquement les stacks Compose | - |
@@ -55,7 +57,7 @@ sudo upgrade_docker --search-dir /srv
 
 ### Stacks Docker Compose
 - Scanne les répertoires configurés à la recherche de `docker-compose.yml` / `docker-compose.yaml`
-- Exclut `vendor/`, `node_modules/`, `html/apps/`, `.git/`
+- Exclut `vendor/`, `node_modules/`, `html/apps/`, `.git/` et **`OLD/`** (stacks archivées) — d'autres dossiers peuvent être ignorés avec `--exclude-dir`
 - **Services avec `build:`** (image construite depuis un `Dockerfile`) : le script lit les `FROM`, **vérifie si l'image de base a une mise à jour**, et **ne reconstruit que dans ce cas** (base pullée, puis `docker compose build`). **Si les bases sont à jour, rien n'est touché.** Sans ça, une image construite localement ne serait jamais mise à jour et sa base vieillirait indéfiniment. Désactivable avec `--no-build`.
   > ⚠️ Ce script met à jour des **images**, il ne **redéploie pas** tes modifications de code locales — pour ça : `docker compose up -d --build`.
   > *(La base est pullée explicitement : `build --pull` ne rafraîchit pas le tag local, la base serait alors vue comme périmée à chaque exécution.)*

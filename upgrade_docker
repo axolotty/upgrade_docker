@@ -16,6 +16,7 @@ MAX_LOG_SIZE=$((5 * 1024 * 1024))
 PULL_TIMEOUT=300
 PARALLEL=20
 SEARCH_DIRS=()
+EXCLUDE_DIRS=()         # --exclude-dir  : dossiers à ignorer au scan (en plus des défauts)
 DRY_RUN=false
 NO_PRUNE=false
 NO_BUILD=false          # --no-build     : ne pas reconstruire les services Compose 'build:'
@@ -58,6 +59,8 @@ Options:
   --parallel N               Jobs simultanés                       [défaut: $PARALLEL]
   --timeout N                Timeout en secondes par pull          [défaut: $PULL_TIMEOUT]
   --search-dir DIR           Répertoire à scanner (répétable)      [défaut: /opt /home /docker_data]
+  --exclude-dir NOM          Dossier à ignorer au scan (répétable)
+                             [toujours ignorés: vendor, node_modules, html/apps, .git, OLD]
   --no-prune                 Ne pas supprimer les images obsolètes
   --no-build                 Ne pas reconstruire les services Compose avec 'build:'
                              (par défaut : reconstruit UNIQUEMENT si l'image de base a une MAJ)
@@ -95,6 +98,7 @@ while [[ $# -gt 0 ]]; do
         --parallel)         PARALLEL="${2:?'--parallel attend un nombre'}"; shift ;;
         --timeout)          PULL_TIMEOUT="${2:?'--timeout attend un nombre'}"; shift ;;
         --search-dir)       SEARCH_DIRS+=("${2:?'--search-dir attend un chemin'}"); shift ;;
+        --exclude-dir)      EXCLUDE_DIRS+=("${2:?'--exclude-dir attend un nom de dossier'}"); shift ;;
         --exclude)          EXCLUDE_IMAGES+=("${2:?'--exclude attend une image'}"); shift ;;
         --image)            SINGLE_IMAGE="${2:?'--image attend une image'}"; shift ;;
         --notify)           NOTIFY_EMAIL="${2:?'--notify attend un email'}"; shift ;;
@@ -730,6 +734,12 @@ if ! $STANDALONE_ONLY; then
 
     _compose_dry_list=()
 
+    # Exclusions du scan : dépendances, archives (OLD) et dossiers demandés via --exclude-dir
+    _find_excl=()
+    for _d in vendor node_modules "html/apps" .git OLD "${EXCLUDE_DIRS[@]+"${EXCLUDE_DIRS[@]}"}"; do
+        _find_excl+=(-not -path "*/$_d/*")
+    done
+
     while IFS= read -r composefile; do
         dir=$(dirname "$composefile")
         log "[DIR] $dir"
@@ -815,10 +825,7 @@ if ! $STANDALONE_ONLY; then
 
     done < <(find "${SEARCH_DIRS[@]}" \
         \( -name "docker-compose.yml" -o -name "docker-compose.yaml" \) \
-        -not -path "*/vendor/*" \
-        -not -path "*/node_modules/*" \
-        -not -path "*/html/apps/*" \
-        -not -path "*/.git/*" \
+        "${_find_excl[@]}" \
         2>/dev/null | sort)
 
     if $DRY_RUN && [[ ${#_compose_dry_list[@]} -gt 0 ]]; then
