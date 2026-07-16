@@ -92,6 +92,7 @@ Les options passées en **ligne de commande priment** sur ce fichier.
 
 ### Dry-run
 - Vérifie les digests distants via l'API registry (sans pull)
+- Registries gérés : Docker Hub, GHCR, LSCR (alias de GHCR), et **tout registry conforme** — le jeton est demandé en lisant le défi `www-authenticate`. Les registries privés **avec un port** (`registry.local:5000/app`) sont correctement analysés, de même que les dépôts publics servis en anonyme (sans jeton)
 - Calcule la taille réelle des layers à télécharger
 - Estime l'espace libéré après prune
 - Pour les services `build:` : lit les `FROM` du Dockerfile et vérifie l'**image de base** (les stages multi-étapes, `FROM $ARG` et `scratch` sont ignorés)

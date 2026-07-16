@@ -200,70 +200,132 @@ run() {
 # =============================================================================
 # DRY-RUN : vérification parallèle + estimation de taille réelle
 # =============================================================================
+# Types de manifest acceptés. Exportés : les helpers tournent dans les sous-shells xargs.
+export MANIFEST_ACCEPT="application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json"
+export PLATFORM_ACCEPT="application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json"
+
+# Découpe un nom d'image en « registry<TAB>repo<TAB>tag ».
+# Un « : » n'introduit un tag que si rien ne le suit jusqu'au prochain « / » : sinon
+# c'est un port (registry.local:5000/app).
+_parse_image_ref() {
+    local image="$1" ref tag registry repo first
+    if [[ "$image" == *:* && "${image##*:}" != */* ]]; then
+        tag="${image##*:}"; ref="${image%:*}"
+    else
+        tag="latest"; ref="$image"
+    fi
+    first="${ref%%/*}"
+    if [[ "$first" == *.* || "$first" == *:* || "$first" == "localhost" ]]; then
+        registry="$first"; repo="${ref#*/}"
+    else
+        # Aucun registry dans le nom : Docker Hub, espace « library/ » si image officielle
+        registry="index.docker.io"
+        [[ "$ref" == */* ]] && repo="$ref" || repo="library/$ref"
+    fi
+    printf '%s\t%s\t%s\n' "$registry" "$repo" "$tag"
+}
+
+# Jeton d'accès en lecture au registry, sur stdout (vide si anonyme ou indisponible)
+_registry_token() {
+    local registry="$1" repo="$2" probe_url="$3"
+    case "$registry" in
+        index.docker.io)
+            curl -4 -s --max-time 10 \
+                "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" \
+                2>/dev/null | jq -r '.token // ""' 2>/dev/null
+            ;;
+        ghcr.io|lscr.io)
+            curl -4 -s --max-time 10 \
+                "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull" \
+                2>/dev/null | jq -r '.token // .access_token // ""' 2>/dev/null
+            ;;
+        *)
+            # Registry quelconque : le défi www-authenticate indique où demander le jeton
+            local www_auth realm service token_url
+            www_auth=$(curl -4 -s -L --max-time 10 -o /dev/null -D - "$probe_url" 2>/dev/null \
+                | grep -i "^www-authenticate:" | head -1)
+            realm=$(printf '%s' "$www_auth" | grep -oP 'realm="[^"]+"' | cut -d'"' -f2)
+            [[ -z "$realm" ]] && return 0
+            service=$(printf '%s' "$www_auth" | grep -oP 'service="[^"]+"' | cut -d'"' -f2)
+            token_url="${realm}?scope=repository:${repo}:pull"
+            [[ -n "$service" ]] && token_url+="&service=${service}"
+            curl -4 -s --max-time 10 "$token_url" 2>/dev/null \
+                | jq -r '.token // .access_token // ""' 2>/dev/null
+            ;;
+    esac
+}
+
+# Récupère un manifest et renseigne <var_code> <var_digest> <var_body> (passées par nom)
+_fetch_manifest() {
+    local url="$1" accept="$2" token="$3"
+    local -n _o_code="$4" _o_digest="$5" _o_body="$6"
+    local args=(-4 -s -L --max-time 15 -H "Accept: $accept")
+    [[ -n "$token" ]] && args+=(-H "Authorization: Bearer $token")
+
+    local tmp_h tmp_body
+    tmp_h=$(mktemp); tmp_body=$(mktemp)
+    _o_code=$(curl "${args[@]}" -D "$tmp_h" -o "$tmp_body" -w "%{http_code}" "$url" 2>/dev/null)
+    _o_body=$(cat "$tmp_body" 2>/dev/null)
+    _o_digest=$(grep -i "^docker-content-digest:" "$tmp_h" | grep -oP 'sha256:[a-f0-9]+' | head -1)
+    rm -f "$tmp_h" "$tmp_body"
+}
+
+# Volume réel à télécharger : somme des layers du manifest de la plateforme locale
+_manifest_size() {
+    local manifest="$1" repo_url="$2" token="$3" os="$4" arch="$5" variant="$6"
+    local size=0
+
+    if ! jq -e '.manifests' <<<"$manifest" >/dev/null 2>&1; then
+        # Manifest mono-architecture : les layers sont déjà là
+        jq '[.layers[].size] | add // 0' <<<"$manifest" 2>/dev/null || echo 0
+        return
+    fi
+
+    # Manifest-list : suivre le manifest correspondant à la plateforme locale
+    local platform_digest
+    # shellcheck disable=SC2016  # $os/$arch/$variant sont des variables jq (--arg), pas shell
+    platform_digest=$(jq -r --arg os "$os" --arg arch "$arch" --arg variant "$variant" \
+        '[ .manifests[]
+           | select(.platform.os == $os and .platform.architecture == $arch
+                    and (if $variant == "" then true else (.platform.variant // "") == $variant end))
+           | .digest ][0] // .manifests[0].digest // ""' <<<"$manifest" 2>/dev/null)
+    [[ -z "$platform_digest" ]] && { echo 0; return; }
+
+    # pm_code/pm_digest inutiles ici : seul le corps du manifest nous intéresse
+    # shellcheck disable=SC2034  # renseignées par nom (nameref) dans _fetch_manifest
+    local pm pm_code pm_digest
+    _fetch_manifest "${repo_url}/${platform_digest}" "$PLATFORM_ACCEPT" "$token" pm_code pm_digest pm
+    size=$(jq '[.layers[].size] | add // 0' <<<"$pm" 2>/dev/null || echo 0)
+    echo "${size:-0}"
+}
+
 # Sortie : LOCAL|OK|UPDATE|FAILED <image> [champs...]
 check_image_dry_run() {
     local image="$1"
-    local local_digest manifest remote_digest
-    local local_size=0
 
+    # Sans RepoDigest, l'image n'a pas d'origine distante (construite localement)
+    local local_digest
     local_digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$image" 2>/dev/null || echo "none")
-    if [[ "$local_digest" == "none" || -z "$local_digest" ]]; then
-        echo "LOCAL $image"; return
-    fi
+    [[ -z "$local_digest" || "$local_digest" == "none" ]] && { echo "LOCAL $image"; return; }
 
-    local inspect_out
+    local local_size local_os local_arch local_variant inspect_out
     inspect_out=$(docker inspect --format='{{.Size}}	{{.Os}}	{{.Architecture}}	{{.Variant}}' "$image" 2>/dev/null)
     IFS=$'\t' read -r local_size local_os local_arch local_variant <<< "$inspect_out"
     local_size="${local_size:-0}"; local_os="${local_os:-linux}"; local_arch="${local_arch:-amd64}"
 
-    # Parsing du nom d'image
-    local ref tag registry repo
-    if [[ "$image" == *:* ]]; then tag="${image##*:}"; ref="${image%:*}"
-    else tag="latest"; ref="$image"
-    fi
-    local first="${ref%%/*}"
-    if [[ "$first" == *.* || "$first" == *:* || "$first" == "localhost" ]]; then
-        registry="$first"; repo="${ref#*/}"
-    else
-        registry="index.docker.io"
-        [[ "$ref" == */* ]] && repo="$ref" || repo="library/$ref"
-    fi
+    local registry repo tag
+    IFS=$'\t' read -r registry repo tag < <(_parse_image_ref "$image")
 
-    local manifest_url="https://${registry}/v2/${repo}/manifests/${tag}"
-    local accept="application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json"
+    # lscr.io n'est qu'un alias de distribution : l'API registry, elle, vit sur ghcr.io
+    local api_host="$registry"
+    [[ "$registry" == "lscr.io" ]] && api_host="ghcr.io"
+    local repo_url="https://${api_host}/v2/${repo}/manifests"
 
-    # Authentification
-    local token=""
-    case "$registry" in
-        index.docker.io)
-            token=$(curl -4 -s --max-time 10 "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" 2>/dev/null | jq -r '.token // ""')
-            ;;
-        ghcr.io|lscr.io)
-            token=$(curl -4 -s --max-time 10 "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull" 2>/dev/null | jq -r '.token // .access_token // ""')
-            [[ "$registry" == "lscr.io" ]] && manifest_url="${manifest_url/lscr.io/ghcr.io}"
-            ;;
-        *)
-            local www_auth realm service
-            www_auth=$(curl -4 -s -L --max-time 10 -o /dev/null -D - "$manifest_url" 2>/dev/null | grep -i "^www-authenticate:" | head -1)
-            realm=$(printf '%s' "$www_auth" | grep -oP 'realm="[^"]+"' | cut -d'"' -f2)
-            service=$(printf '%s' "$www_auth" | grep -oP 'service="[^"]+"' | cut -d'"' -f2)
-            if [[ -n "$realm" ]]; then
-                local token_url="${realm}?scope=repository:${repo}:pull"
-                [[ -n "$service" ]] && token_url+="&service=${service}"
-                token=$(curl -4 -s --max-time 10 "$token_url" 2>/dev/null | jq -r '.token // .access_token // ""')
-            fi
-            ;;
-    esac
+    local token
+    token=$(_registry_token "$registry" "$repo" "${repo_url}/${tag}")
 
-    local curl_args=(-4 -s -L --max-time 15 -H "Accept: $accept")
-    [[ -n "$token" ]] && curl_args+=(-H "Authorization: Bearer $token")
-
-    local tmp_h tmp_body http_code
-    tmp_h=$(mktemp); tmp_body=$(mktemp)
-    http_code=$(curl "${curl_args[@]}" -D "$tmp_h" -o "$tmp_body" -w "%{http_code}" "$manifest_url" 2>/dev/null)
-    manifest=$(cat "$tmp_body" 2>/dev/null)
-    remote_digest=$(grep -i "^docker-content-digest:" "$tmp_h" | grep -oP 'sha256:[a-f0-9]+' | head -1)
-    rm -f "$tmp_h" "$tmp_body"
+    local http_code remote_digest manifest
+    _fetch_manifest "${repo_url}/${tag}" "$MANIFEST_ACCEPT" "$token" http_code remote_digest manifest
 
     # Image absente du registry :
     #   - 404 : standard
@@ -272,46 +334,23 @@ check_image_dry_run() {
     #   - body MANIFEST_UNKNOWN/NAME_UNKNOWN : variante selon le registry
     if [[ "$http_code" == "404" ]] || \
        [[ "$http_code" == "401" && "$registry" == "index.docker.io" && -n "$token" ]] || \
-       echo "$manifest" | grep -qE '"(MANIFEST_UNKNOWN|NAME_UNKNOWN)"' 2>/dev/null; then
+       grep -qE '"(MANIFEST_UNKNOWN|NAME_UNKNOWN)"' <<<"$manifest" 2>/dev/null; then
         echo "LOCAL $image"; return
     fi
+    [[ -z "$manifest" || -z "$remote_digest" ]] && { echo "FAILED $image"; return; }
 
-    if [[ -z "$manifest" || -z "$remote_digest" ]]; then
-        echo "FAILED $image"; return
-    fi
-
-    # Si à jour et pas de --force, on s'arrête là
-    local _forced=false
+    # À jour : on s'arrête là, sauf --force (qui doit afficher la taille)
+    local forced=false
     if [[ "$local_digest" == *"$remote_digest"* ]]; then
         [[ "${FORCE_PULL:-false}" != "true" ]] && { echo "OK $image $local_size"; return; }
-        _forced=true
+        forced=true
     fi
 
-    # Taille réelle : somme des layers du manifest de plateforme
-    local remote_size=0
-    if echo "$manifest" | jq -e '.manifests' > /dev/null 2>&1; then
-        # Manifest-list : récupérer le manifest de la plateforme locale
-        local platform_digest
-        platform_digest=$(echo "$manifest" | jq -r --arg os "$local_os" --arg arch "$local_arch" --arg variant "$local_variant" '[ .manifests[] | select(.platform.os == $os and .platform.architecture == $arch and (if $variant == "" then true else (.platform.variant // "") == $variant end)) | .digest ][0] // .manifests[0].digest // "" ' 2>/dev/null)
-
-        if [[ -n "$platform_digest" ]]; then
-            local pm_url="https://${registry}/v2/${repo}/manifests/${platform_digest}"
-            local pm_accept="application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json"
-            local pm_args=(-4 -s -L --max-time 15 -H "Accept: $pm_accept")
-            [[ -n "$token" ]] && pm_args+=(-H "Authorization: Bearer $token")
-            local pm
-            pm=$(curl "${pm_args[@]}" "$pm_url" 2>/dev/null)
-            remote_size=$(echo "$pm" | jq '[.layers[].size] | add // 0' 2>/dev/null || echo 0)
-        fi
-    else
-        # Manifest mono-arch
-        remote_size=$(echo "$manifest" | jq '[.layers[].size] | add // 0' 2>/dev/null || echo 0)
-    fi
-
-    local local_digest_short="${local_digest##*@}"
-    echo "UPDATE $image $local_size ${remote_size:-0} $local_digest_short $remote_digest $_forced"
+    local remote_size
+    remote_size=$(_manifest_size "$manifest" "$repo_url" "$token" "$local_os" "$local_arch" "$local_variant")
+    echo "UPDATE $image $local_size ${remote_size:-0} ${local_digest##*@} $remote_digest $forced"
 }
-export -f check_image_dry_run
+export -f _parse_image_ref _registry_token _fetch_manifest _manifest_size check_image_dry_run
 export FORCE_PULL
 
 run_dry_run_checks() {
@@ -514,6 +553,7 @@ _build_run_args() {
     fi
 
     # Ports publiés (udp inclus)
+    # shellcheck disable=SC2016  # $cp est une variable jq, elle ne doit pas être expansée par le shell
     _collect _a -p "$c" '.[0].HostConfig.PortBindings // {} | to_entries[] | .key as $cp | .value[]?
         | ((if (.HostIp // "") != "" and .HostIp != "0.0.0.0" then .HostIp + ":" else "" end)
            + (.HostPort // "") + ":" + ($cp | split("/")[0])
@@ -527,8 +567,10 @@ _build_run_args() {
     _collect _a --tmpfs "$c" '.[0].HostConfig.Tmpfs // {} | keys[]?'
 
     # Env et labels : uniquement ce qui diffère de l'image (Traefik & co pour les labels)
+    # shellcheck disable=SC2016  # $e/$ie/$il sont des variables jq (--argjson), pas shell
     _collect _a -e "$c" '.[0].Config.Env // [] | .[] | select(. as $e | ($ie | index($e)) == null)' \
         --argjson ie "$(_jqv "$img" '.[0].Config.Env // []')"
+    # shellcheck disable=SC2016  # idem : $il est passé à jq via --argjson
     _collect _a -l "$c" '.[0].Config.Labels // {} | to_entries[] | select(.value != ($il[.key] // null)) | .key + "=" + .value' \
         --argjson il "$(_jqv "$img" '.[0].Config.Labels // {}')"
 
@@ -693,7 +735,11 @@ print_summary() {
     if [[ ${#UPDATED_IMAGES[@]} -gt 0 ]]; then
         local -a _uniq
         mapfile -t _uniq < <(printf '%s\n' "${UPDATED_IMAGES[@]}" | sort -u)
-        $DRY_RUN && log "${C_YELLOW}[UPDATE]${C_RESET} Images a mettre a jour (${#_uniq[@]}) :" || log "${C_YELLOW}[UPDATE]${C_RESET} Images mises a jour (${#_uniq[@]}) :"
+        if $DRY_RUN; then
+            log "${C_YELLOW}[UPDATE]${C_RESET} Images a mettre a jour (${#_uniq[@]}) :"
+        else
+            log "${C_YELLOW}[UPDATE]${C_RESET} Images mises a jour (${#_uniq[@]}) :"
+        fi
         printf '   . %s\n' "${_uniq[@]}"
     else
         log "${C_GREEN}[OK]${C_RESET} Toutes les images sont a jour"
