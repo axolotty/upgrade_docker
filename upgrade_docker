@@ -441,17 +441,21 @@ _snapshot_digests() {
 }
 
 # _report_stack_updates <tableau assoc d'avant> : logue et alimente UPDATED_IMAGES
+# Renvoie 0 si au moins une image de la stack a change (c'est ce qui autorise le 'up -d')
 _report_stack_updates() {
     # shellcheck disable=SC2178  # _snap est un nameref vers un tableau associatif
     local -n _snap=$1
     local img after
+    local changed=1
     for img in "${!_snap[@]}"; do
         after=$(docker inspect --format='{{index .RepoDigests 0}}' "$img" 2>/dev/null || echo "none")
         if [[ "${_snap[$img]}" != "$after" ]]; then
             log "   ${C_YELLOW}[UPDATE]${C_RESET} $img"
             UPDATED_IMAGES+=("$img")
+            changed=0
         fi
     done
+    return $changed
 }
 
 # --- Stacks qui construisent leurs images (build:) -----------------------------
@@ -935,13 +939,16 @@ if ! $STANDALONE_ONLY; then
         fi
 
         # Reconstruction UNIQUEMENT si une image de base a une MAJ (sinon on ne touche à rien)
+        _rebuilt=false
         if [[ ${#_builds[@]} -gt 0 ]]; then
             if $NO_BUILD; then
                 log "   [BUILD] ${#_builds[@]} service(s) buildable(s) — ignore (--no-build)"
             elif _update_build_bases "${_builds[@]}" || $FORCE_PULL || $FORCE_REBOOT; then
                 # base déjà pullée ci-dessus : pas de --pull ici (il ne rafraîchit pas le tag local)
                 log "   [BUILD] Reconstruction de ${#_builds[@]} service(s) sur la nouvelle base"
-                if ! (cd "$dir" && docker compose build 2>&1 | sed 's/^/   /'); then
+                if (cd "$dir" && docker compose build 2>&1 | sed 's/^/   /'); then
+                    _rebuilt=true
+                else
                     warn "Echec du 'build' pour $dir"
                     FAILED_IMAGES+=("compose-build:$dir")
                 fi
@@ -955,8 +962,17 @@ if ! $STANDALONE_ONLY; then
 
         # --ignore-buildable : sans ça, 'pull' sort en erreur sur les services build: (stack vue en echec)
         if (cd "$dir" && docker compose pull "${_PULL_OPTS[@]+"${_PULL_OPTS[@]}"}" 2>&1 | sed 's/^/   /'); then
-            _report_stack_updates _dg_before
-            if (cd "$dir" && docker compose up -d --remove-orphans 2>&1 | sed 's/^/   /'); then
+            # 'up -d' UNIQUEMENT si quelque chose a bouge. Le lancer a chaque passage n'est pas
+            # neutre : il demarre une stack volontairement eteinte, applique une derive de
+            # config jamais deployee, et Compose recree systematiquement les services en
+            # 'network_mode: service:X' — soit un redemarrage a chaque run pour rien.
+            _changed=false
+            _report_stack_updates _dg_before && _changed=true
+            $_rebuilt && _changed=true
+
+            if ! $_changed && ! $FORCE_REBOOT; then
+                log "   [OK] Rien de nouveau — ${C_GREEN}stack laissee en l'etat${C_RESET}"
+            elif (cd "$dir" && docker compose up -d --remove-orphans 2>&1 | sed 's/^/   /'); then
                 log "   [OK] Stack demarree"
                 if $FORCE_REBOOT; then
                     log "   [FORCE-REBOOT] Recreation forcee de tous les services"

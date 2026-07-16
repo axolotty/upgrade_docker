@@ -104,10 +104,17 @@ Les options passées en **ligne de commande priment** sur ce fichier.
   indéfiniment. Désactivable avec `--no-build`.
   > La base est pullée **explicitement**, car `build --pull` ne rafraîchit pas le tag local :
   > la base serait alors vue comme périmée à chaque exécution, et reconstruite pour rien.
-- Puis `docker compose pull` + `docker compose up -d --remove-orphans`. Le drapeau
-  `--ignore-buildable` est ajouté **s'il est supporté** par la version de Compose installée :
-  sans lui, `pull` sort en erreur sur les services `build:` et la stack entière serait
-  comptée en échec
+- Puis `docker compose pull`. Le drapeau `--ignore-buildable` est ajouté **s'il est supporté**
+  par la version de Compose installée : sans lui, `pull` sort en erreur sur les services
+  `build:` et la stack entière serait comptée en échec
+- `docker compose up -d --remove-orphans` n'est lancé **que si une image a réellement changé**
+  (pullée ou reconstruite), ou avec `--force-reboot`. Sinon la stack est laissée en l'état :
+  `[OK] Rien de nouveau`.
+  > Lancer `up -d` à chaque passage n'est pas neutre : il démarre une stack volontairement
+  > éteinte, applique une dérive de config jamais déployée, et surtout Compose **recrée
+  > systématiquement** les services en `network_mode: service:X` — soit un redémarrage à chaque
+  > exécution, pour rien. C'est un comportement de Compose (reproductible à la main, sans ce
+  > script), mais un `up -d` inconditionnel le déclenchait à tous les coups.
 - Avec `--force-reboot` : `docker compose up -d --force-recreate`
 
 ### Images standalone
@@ -155,14 +162,18 @@ Le dry-run et le run réel donnent **le même verdict sur les mêmes images** : 
 
 ## Pièges et limites connues
 
-### ⚠️ Le script démarre les stacks éteintes
+### ⚠️ Une stack éteinte peut être démarrée — si elle a une mise à jour
 
-Le chemin Compose se termine par `docker compose up -d`. Une stack **volontairement arrêtée**
-qui se trouve dans un répertoire scanné sera donc **démarrée**. Le script ne fait aucune
-différence entre « éteinte parce que cassée » et « éteinte parce que je l'ai voulu ».
+`docker compose up -d` n'est lancé **que si quelque chose a bougé** (image pullée ou
+reconstruite), ou avec `--force-reboot`. Une stack éteinte dont rien n'a changé est donc
+laissée tranquille.
 
-Pour qu'une stack reste à l'arrêt : la déplacer dans un `OLD/` (exclu par défaut) ou l'ajouter
-à `EXCLUDE_DIRS`.
+Mais si l'une de ses images a une mise à jour, `up -d` s'exécute — et **démarre la stack**. Le
+script ne fait aucune différence entre « éteinte parce que cassée » et « éteinte parce que je
+l'ai voulu ».
+
+Pour qu'une stack reste à l'arrêt quoi qu'il arrive : la déplacer dans un `OLD/` (exclu par
+défaut) ou l'ajouter à `EXCLUDE_DIRS`.
 
 ### ⚠️ Deux dossiers de même nom = un seul projet Compose
 
