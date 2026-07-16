@@ -60,7 +60,7 @@ Options:
   --search-dir DIR           Répertoire à scanner (répétable)      [défaut: /opt /home /docker_data]
   --no-prune                 Ne pas supprimer les images obsolètes
   --no-build                 Ne pas reconstruire les services Compose avec 'build:'
-                             (par défaut : image de base re-pullée + image reconstruite)
+                             (par défaut : reconstruit UNIQUEMENT si l'image de base a une MAJ)
   --compose-only             Traite uniquement les stacks Compose
   --standalone-only          Traite uniquement les images standalone
   --force                    Traite aussi les images déjà à jour (effet visible en --dry-run :
@@ -361,6 +361,39 @@ _compose_build_services() {
     docker compose -f "$1" config --format json 2>/dev/null \
         | jq -r '.services | to_entries[] | select(.value.build != null)
                  | .key + "|" + (.value.build.context // ".") + "|" + (.value.build.dockerfile // "Dockerfile")' 2>/dev/null
+}
+
+# Met à jour les images de BASE des services build:, et renvoie 0 si au moins une a bougé
+# (⇒ il faut reconstruire). Si toutes les bases sont à jour : on ne reconstruit pas — ce
+# script met à jour des IMAGES, il ne redéploie pas le code local (pour ça : up -d --build).
+#
+# NB : on pull la base EXPLICITEMENT car `compose build --pull` ne rafraîchit pas le tag
+#      local (BuildKit la garde dans son propre cache) : la base serait alors vue comme
+#      périmée à chaque exécution et on reconstruirait indéfiniment.
+_update_build_bases() {
+    local bs svc ctx df base st need=1
+    for bs in "$@"; do
+        IFS='|' read -r svc ctx df <<< "$bs"
+        [[ "$df" != /* ]] && df="$ctx/$df"
+        while IFS= read -r base; do
+            [[ -z "$base" ]] && continue
+            [[ "$base" == *:* ]] || base="${base}:latest"
+            st=$(check_image_dry_run "$base" | awk '{print $1}')
+            case "$st" in
+                UPDATE)
+                    log "   [BUILD] $svc — base $base : ${C_YELLOW}mise a jour disponible${C_RESET}"
+                    if timeout "$PULL_TIMEOUT" docker pull "$base" >/dev/null 2>&1; then
+                        need=0
+                    else
+                        warn "$svc : pull de la base $base echoue"
+                    fi
+                    ;;
+                OK) log "   [BUILD] $svc — base $base : ${C_GREEN}deja a jour${C_RESET}" ;;
+                *)  log "   [BUILD] $svc — base $base : non verifiable ($st)" ;;
+            esac
+        done < <(_dockerfile_bases "$df")
+    done
+    return $need
 }
 
 # Images de base (FROM) d'un Dockerfile : ignore les stages multi-étapes, les ARG et scratch.
@@ -747,16 +780,19 @@ if ! $STANDALONE_ONLY; then
             continue
         fi
 
-        # Reconstruction avant le pull : 'build --pull' retélécharge l'image de base puis rebuild
+        # Reconstruction UNIQUEMENT si une image de base a une MAJ (sinon on ne touche à rien)
         if [[ ${#_builds[@]} -gt 0 ]]; then
             if $NO_BUILD; then
                 log "   [BUILD] ${#_builds[@]} service(s) buildable(s) — ignore (--no-build)"
-            else
-                log "   [BUILD] Reconstruction de ${#_builds[@]} service(s) (re-pull de l'image de base)"
-                if ! (cd "$dir" && docker compose build --pull 2>&1 | sed 's/^/   /'); then
-                    warn "Echec du 'build --pull' pour $dir"
+            elif _update_build_bases "${_builds[@]}" || $FORCE_PULL || $FORCE_REBOOT; then
+                # base déjà pullée ci-dessus : pas de --pull ici (il ne rafraîchit pas le tag local)
+                log "   [BUILD] Reconstruction de ${#_builds[@]} service(s) sur la nouvelle base"
+                if ! (cd "$dir" && docker compose build 2>&1 | sed 's/^/   /'); then
+                    warn "Echec du 'build' pour $dir"
                     FAILED_IMAGES+=("compose-build:$dir")
                 fi
+            else
+                log "   [BUILD] Images de base a jour — ${C_GREEN}aucune reconstruction${C_RESET}"
             fi
         fi
 

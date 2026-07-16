@@ -41,7 +41,7 @@ sudo upgrade_docker --search-dir /srv
 | `--timeout N` | Timeout en secondes par pull | 300 |
 | `--search-dir DIR` | Répertoire à scanner (répétable) | `/opt /home /docker_data` |
 | `--no-prune` | Ne pas supprimer les images obsolètes | - |
-| `--no-build` | Ne pas reconstruire les services Compose avec `build:` (par défaut : base re-pullée + image reconstruite) | - |
+| `--no-build` | Ne pas reconstruire les services Compose avec `build:` (par défaut : reconstruit **uniquement si l'image de base a une MAJ**) | - |
 | `--compose-only` | Traite uniquement les stacks Compose | - |
 | `--standalone-only` | Traite uniquement les images standalone | - |
 | `--force` | Traite aussi les images déjà à jour — effet visible en `--dry-run` (signalées `[FORCE]`) ; en mode normal toutes les images sont déjà pullées | - |
@@ -56,7 +56,9 @@ sudo upgrade_docker --search-dir /srv
 ### Stacks Docker Compose
 - Scanne les répertoires configurés à la recherche de `docker-compose.yml` / `docker-compose.yaml`
 - Exclut `vendor/`, `node_modules/`, `html/apps/`, `.git/`
-- **Services avec `build:`** (image construite depuis un `Dockerfile`) : `docker compose build --pull` → **retélécharge l'image de base** puis **reconstruit** l'image. Sans ça, une image construite localement n'est jamais mise à jour et sa base vieillit indéfiniment. Désactivable avec `--no-build`.
+- **Services avec `build:`** (image construite depuis un `Dockerfile`) : le script lit les `FROM`, **vérifie si l'image de base a une mise à jour**, et **ne reconstruit que dans ce cas** (base pullée, puis `docker compose build`). **Si les bases sont à jour, rien n'est touché.** Sans ça, une image construite localement ne serait jamais mise à jour et sa base vieillirait indéfiniment. Désactivable avec `--no-build`.
+  > ⚠️ Ce script met à jour des **images**, il ne **redéploie pas** tes modifications de code locales — pour ça : `docker compose up -d --build`.
+  > *(La base est pullée explicitement : `build --pull` ne rafraîchit pas le tag local, la base serait alors vue comme périmée à chaque exécution.)*
 - Puis `docker compose pull --ignore-buildable` + `docker compose up -d --remove-orphans`
 - Avec `--force-reboot` : `docker compose up -d --force-recreate`
 
