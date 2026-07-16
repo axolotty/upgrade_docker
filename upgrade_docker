@@ -378,6 +378,34 @@ estimate_prune_size() {
     '
 }
 
+# --- Suivi des mises à jour d'une stack Compose --------------------------------
+# 'compose pull' ne dit pas quelles images ont bougé : on releve les digests avant/après.
+
+# _snapshot_digests <tableau assoc> <composefile>
+_snapshot_digests() {
+    local -n _snap=$1
+    local img
+    _snap=()
+    while IFS= read -r img; do
+        [[ -z "$img" ]] && continue
+        [[ "$img" == *:* ]] || img="${img}:latest"
+        _snap["$img"]=$(docker inspect --format='{{index .RepoDigests 0}}' "$img" 2>/dev/null || echo "none")
+    done < <(docker compose -f "$2" config --images 2>/dev/null || true)
+}
+
+# _report_stack_updates <tableau assoc d'avant> : logue et alimente UPDATED_IMAGES
+_report_stack_updates() {
+    local -n _snap=$1
+    local img after
+    for img in "${!_snap[@]}"; do
+        after=$(docker inspect --format='{{index .RepoDigests 0}}' "$img" 2>/dev/null || echo "none")
+        if [[ "${_snap[$img]}" != "$after" ]]; then
+            log "   ${C_YELLOW}[UPDATE]${C_RESET} $img"
+            UPDATED_IMAGES+=("$img")
+        fi
+    done
+}
+
 # --- Stacks qui construisent leurs images (build:) -----------------------------
 # "service|contexte|dockerfile" pour chaque service Compose qui construit son image.
 _compose_build_services() {
@@ -407,6 +435,7 @@ _update_build_bases() {
                     log "   [BUILD] $svc — base $base : ${C_YELLOW}mise a jour disponible${C_RESET}"
                     if timeout "$PULL_TIMEOUT" docker pull "$base" >/dev/null 2>&1; then
                         need=0
+                        UPDATED_IMAGES+=("$base (base de $svc)")
                     else
                         warn "$svc : pull de la base $base echoue"
                     fi
@@ -661,8 +690,10 @@ print_summary() {
     echo "════════════════════════════════════════════════════════"
 
     if [[ ${#UPDATED_IMAGES[@]} -gt 0 ]]; then
-        $DRY_RUN && log "${C_YELLOW}[UPDATE]${C_RESET} Images a mettre a jour (${#UPDATED_IMAGES[@]}) :" || log "${C_YELLOW}[UPDATE]${C_RESET} Images mises a jour (${#UPDATED_IMAGES[@]}) :"
-        printf '   . %s\n' "${UPDATED_IMAGES[@]}"
+        local -a _uniq
+        mapfile -t _uniq < <(printf '%s\n' "${UPDATED_IMAGES[@]}" | sort -u)
+        $DRY_RUN && log "${C_YELLOW}[UPDATE]${C_RESET} Images a mettre a jour (${#_uniq[@]}) :" || log "${C_YELLOW}[UPDATE]${C_RESET} Images mises a jour (${#_uniq[@]}) :"
+        printf '   . %s\n' "${_uniq[@]}"
     else
         log "${C_GREEN}[OK]${C_RESET} Toutes les images sont a jour"
     fi
@@ -754,6 +785,7 @@ if ! $STANDALONE_ONLY; then
     log "=== 1/3 — Stacks Docker Compose ==="
 
     _compose_dry_list=()
+    declare -A _dg_before=()      # digests des images d'une stack avant son pull
 
     # Exclusions du scan : dépendances, archives (OLD) et dossiers demandés via --exclude-dir
     _find_excl=()
@@ -827,8 +859,12 @@ if ! $STANDALONE_ONLY; then
             fi
         fi
 
+        # Empreinte avant pull, pour pouvoir rapporter ce qui a réellement bougé
+        _snapshot_digests _dg_before "$composefile"
+
         # --ignore-buildable : sans ça, 'pull' sort en erreur sur les services build: (stack vue en echec)
         if (cd "$dir" && docker compose pull "${_PULL_OPTS[@]+"${_PULL_OPTS[@]}"}" 2>&1 | sed 's/^/   /'); then
+            _report_stack_updates _dg_before
             if (cd "$dir" && docker compose up -d --remove-orphans 2>&1 | sed 's/^/   /'); then
                 log "   [OK] Stack demarree"
                 if $FORCE_REBOOT; then
