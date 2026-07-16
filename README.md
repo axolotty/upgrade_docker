@@ -86,7 +86,8 @@ Les options passées en **ligne de commande priment** sur ce fichier.
 - Pull parallèle avec `xargs -P`
 - Les conteneurs concernés sont repérés **avant** le pull (après, le tag pointe déjà sur la nouvelle image et ils deviendraient introuvables)
 - Si le digest change (ou avec `--force-reboot`) : le conteneur est **recréé à l'identique** depuis son `docker inspect` — labels (Traefik…), ports, volumes (binds **et** volumes nommés), variables d'env, réseau (y compris `network_mode: container:xxx`), limites RAM/CPU/pids, devices, capabilities, DNS, log driver, user, workdir, commande et entrypoint
-- **Bascule sécurisée** : l'ancien conteneur est *renommé*, puis supprimé **seulement si** le nouveau démarre — sinon **rollback automatique** sur l'ancien
+- **Bascule sécurisée** : l'ancien conteneur est *renommé*, puis supprimé **seulement si** le `docker run` du nouveau réussit — sinon **rollback automatique** sur l'ancien (vérifié : le conteneur d'origine est restauré à l'identique et redémarré)
+- Une image sans équivalent dans un registry (construite localement, mais portant quand même un `RepoDigest`) est **ignorée**, pas comptée en échec — même verdict que le `--dry-run`
 - Env et labels ne sont réinjectés que s'ils **diffèrent de l'image** : réinjecter ses défauts figerait l'ancienne version et annulerait la mise à jour
 - Images locales (sans registry) : ignorées automatiquement
 
@@ -105,6 +106,12 @@ La recréation reconstruit un `docker run` à partir de l'inspect : quelques ré
 - `ulimits`, `sysctls`, réservations **GPU**
 - **alias réseau** et **IP statiques**
 - entrypoint personnalisé **multi-arguments**
+
+Et surtout, une limite du **rollback** : il se déclenche si `docker run` échoue, pas si le
+conteneur démarre **puis meurt**. Une nouvelle image qui casse l'application (le process
+sort aussitôt, le conteneur boucle sur sa `restart policy`) est vue comme un succès : `docker run`
+a rendu 0, donc l'ancien conteneur est supprimé. L'ancienne **image** reste disponible pour
+revenir en arrière à la main (sauf `prune`), mais le conteneur, lui, est perdu.
 
 Pour ces cas (et de manière générale), une **stack Compose** reste préférable : le chemin Compose (`docker compose up -d`) reproduit tout fidèlement.
 

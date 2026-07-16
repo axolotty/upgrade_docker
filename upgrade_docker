@@ -695,6 +695,13 @@ pull_and_restart() {
     containers=$(docker ps --filter "ancestor=$image" --format "{{.Names}}" | tr '\n' ' ')
 
     if ! timeout "$timeout_val" docker pull "$image" >/dev/null 2>&1; then
+        # Pull impossible : image construite localement, ou vrai echec ?
+        # Une image issue d'un build porte quand meme un RepoDigest : seul le registry
+        # fait foi. On delegue au verdict du dry-run pour que les deux modes s'accordent —
+        # sinon le dry-run annonce [LOCAL] et le run reel compte un echec.
+        if [[ "$(check_image_dry_run "$image" | awk '{print $1}')" == "LOCAL" ]]; then
+            echo "SKIPPED_LOCAL $image"; return
+        fi
         echo "PULL_FAILED $image"; return
     fi
 
@@ -978,6 +985,10 @@ if ! $COMPOSE_ONLY; then
                     PULL_FAILED)
                         warn "Pull echoue ou timeout : $image"
                         FAILED_IMAGES+=("$image")
+                        ;;
+                    SKIPPED_LOCAL)
+                        log "[LOCAL] $image — image locale (pas de registry, ignorée)"
+                        SKIPPED+=("$image (locale)")
                         ;;
                     UPDATED)
                         log "${C_YELLOW}[UPDATE]${C_RESET} $image — mis a jour"
