@@ -53,6 +53,23 @@ sudo upgrade_docker --exclude-dir BACKUP   # ignorer aussi les dossiers BACKUP/
 | `--notify EMAIL` | Envoie un mail en cas d'échec (nécessite `mail`) | - |
 | `--log FILE` | Fichier de log | `/var/log/docker-update.log` |
 
+## Configuration (optionnelle)
+
+Pour figer ses propres défauts sans retaper d'options, créer `/etc/upgrade_docker.conf`
+(système) ou `~/.config/upgrade_docker.conf` (utilisateur) :
+
+```bash
+# Stacks à ne jamais scanner (archives, doublons, clones de repo d'ops…)
+EXCLUDE_DIRS=(vieille-stack mon-repo-ops)
+
+# Autres défauts possibles
+SEARCH_DIRS=(/opt /srv)
+PARALLEL=10
+NOTIFY_EMAIL=admin@exemple.fr
+```
+
+Les options passées en **ligne de commande priment** sur ce fichier.
+
 ## Fonctionnement
 
 ### Stacks Docker Compose

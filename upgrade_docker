@@ -28,6 +28,21 @@ NOTIFY_EMAIL=""
 EXCLUDE_IMAGES=()
 SINGLE_IMAGE=""
 
+_CONF_LOADED=""
+
+# --- Fichier de configuration (optionnel) -------------------------------------
+# Permet de figer ses propres défauts sans les retaper à chaque fois :
+#   EXCLUDE_DIRS=(vieille-stack archive)   SEARCH_DIRS=(/opt /srv)
+#   PARALLEL=10   NOTIFY_EMAIL=admin@exemple.fr   LOG_FILE=/var/log/docker-update.log
+# Les options passées en ligne de commande priment sur ce fichier.
+for _conf in /etc/upgrade_docker.conf "${XDG_CONFIG_HOME:-$HOME/.config}/upgrade_docker.conf"; do
+    if [[ -f "$_conf" ]]; then
+        # shellcheck source=/dev/null
+        source "$_conf" || { echo "Erreur : configuration illisible : $_conf" >&2; exit 1; }
+        _CONF_LOADED="$_conf"
+    fi
+done
+
 START_TIME=$SECONDS
 
 UPDATED_IMAGES=()
@@ -74,6 +89,10 @@ Options:
   --notify EMAIL             Envoie un mail en cas d'échec (nécessite 'mail')
   --log FILE                 Fichier de log                        [défaut: $LOG_FILE]
   --help                     Affiche cette aide
+
+Configuration (optionnelle) : /etc/upgrade_docker.conf ou ~/.config/upgrade_docker.conf
+  Permet de figer ses défauts, ex. :  EXCLUDE_DIRS=(vieille-stack archive)
+  Les options ci-dessus priment sur le fichier de config.
 
 Exemples:
   $(basename "$0") --dry-run
@@ -708,6 +727,8 @@ $NO_PRUNE        && _flags+=" [NO-PRUNE]"
 
 log "=== Démarrage $(date '+%Y-%m-%d %H:%M:%S')${_flags} ==="
 log "    parallel=${PARALLEL}  timeout=${PULL_TIMEOUT}s  search-dirs=${SEARCH_DIRS[*]}"
+[[ -n "$_CONF_LOADED" ]]          && log "    config=${_CONF_LOADED}"
+[[ ${#EXCLUDE_DIRS[@]} -gt 0 ]]   && log "    dossiers exclus=${EXCLUDE_DIRS[*]}"
 [[ ${#EXCLUDE_IMAGES[@]} -gt 0 ]] && log "    exclusions=${EXCLUDE_IMAGES[*]}"
 [[ -n "$SINGLE_IMAGE" ]]          && log "    image cible=${SINGLE_IMAGE}"
 
