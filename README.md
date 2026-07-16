@@ -60,7 +60,10 @@ sudo upgrade_docker --search-dir /srv
 ### Images standalone
 - Liste toutes les images locales hors stacks Compose
 - Pull parallèle avec `xargs -P`
-- Si l'image change de digest : recrée le conteneur via `docker run` (reconstruit depuis `docker inspect`)
+- Les conteneurs concernés sont repérés **avant** le pull (après, le tag pointe déjà sur la nouvelle image et ils deviendraient introuvables)
+- Si le digest change (ou avec `--force-reboot`) : le conteneur est **recréé à l'identique** depuis son `docker inspect` — labels (Traefik…), ports, volumes (binds **et** volumes nommés), variables d'env, réseau (y compris `network_mode: container:xxx`), limites RAM/CPU/pids, devices, capabilities, DNS, log driver, user, workdir, commande et entrypoint
+- **Bascule sécurisée** : l'ancien conteneur est *renommé*, puis supprimé **seulement si** le nouveau démarre — sinon **rollback automatique** sur l'ancien
+- Env et labels ne sont réinjectés que s'ils **diffèrent de l'image** : réinjecter ses défauts figerait l'ancienne version et annulerait la mise à jour
 - Images locales (sans registry) : ignorées automatiquement
 
 ### Dry-run
@@ -68,6 +71,16 @@ sudo upgrade_docker --search-dir /srv
 - Calcule la taille réelle des layers à télécharger
 - Estime l'espace libéré après prune
 - Labels : `[OK]` à jour · `[UPDATE]` mise à jour disponible · `[FORCE]` forcé mais déjà à jour · `[LOCAL]` image locale
+
+## Limites connues (images standalone)
+
+La recréation reconstruit un `docker run` à partir de l'inspect : quelques réglages ne sont **pas** reproduits — le script **prévient explicitement** quand il en détecte :
+
+- `ulimits`, `sysctls`, réservations **GPU**
+- **alias réseau** et **IP statiques**
+- entrypoint personnalisé **multi-arguments**
+
+Pour ces cas (et de manière générale), une **stack Compose** reste préférable : le chemin Compose (`docker compose up -d`) reproduit tout fidèlement.
 
 ## Prérequis
 

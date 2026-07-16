@@ -351,116 +351,131 @@ estimate_prune_size() {
 # MODE NORMAL : pull + récréation de conteneur
 # =============================================================================
 
-# Recrée un conteneur à l'identique depuis son inspect, après un pull.
-#
-# Deux principes :
+# --- Recréation d'un conteneur standalone -------------------------------------
+# Reconstruit `docker run` depuis l'inspect du conteneur. Deux principes :
 #  - on ne réinjecte que ce qui DIFFÈRE de l'image (env, labels, cmd, entrypoint) :
-#    réinjecter les défauts de l'image figerait l'ancienne version et annulerait la MAJ ;
+#    réinjecter ses défauts figerait l'ancienne version et annulerait la mise à jour ;
 #  - l'ancien conteneur est RENOMMÉ (pas supprimé) : si le run échoue, on le restaure.
-recreate_container() {
-    local name="$1"
-    local image="$2"
-    local c img x
-    c=$(docker inspect "$name" 2>/dev/null)     || { warn "inspect echoue pour $name"; return 1; }
-    img=$(docker inspect "$image" 2>/dev/null)  || img='[{}]'
 
-    local -a args=(-d --name "$name")
+# Valeur scalaire d'un filtre jq (chaîne vide si absent).
+_jqv() { jq -r "$2" <<<"$1" 2>/dev/null; }
 
-    # Restart policy
+# Ajoute "<flag> <valeur>" au tableau pour chaque ligne non vide produite par le filtre.
+#   _collect <tableau> <flag> <json> <filtre> [args jq supplémentaires...]
+_collect() {
+    local -n _arr=$1
+    local flag=$2 json=$3 filter=$4; shift 4
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && _arr+=("$flag" "$line")
+    done < <(jq -r "$@" "$filter" <<<"$json" 2>/dev/null)
+}
+
+# Construit les arguments de `docker run`.  _build_run_args <tableau> <nom> <json_conteneur> <image> <json_image>
+_build_run_args() {
+    local -n _a=$1
+    local name=$2 c=$3 image=$4 img=$5
+    local x
+    _a=(-d --name "$name")
+
+    # Politique de redémarrage
     local rp rc
-    rp=$(jq -r '.[0].HostConfig.RestartPolicy.Name // ""'             <<<"$c")
-    rc=$(jq -r '.[0].HostConfig.RestartPolicy.MaximumRetryCount // 0' <<<"$c")
-    if   [[ "$rp" == "on-failure" && "$rc" -gt 0 ]]; then args+=(--restart "on-failure:$rc")
-    elif [[ -n "$rp" && "$rp" != "no" ]];           then args+=(--restart "$rp")
+    rp=$(_jqv "$c" '.[0].HostConfig.RestartPolicy.Name // ""')
+    rc=$(_jqv "$c" '.[0].HostConfig.RestartPolicy.MaximumRetryCount // 0')
+    if   [[ "$rp" == "on-failure" && "$rc" -gt 0 ]]; then _a+=(--restart "on-failure:$rc")
+    elif [[ -n "$rp" && "$rp" != "no" ]];           then _a+=(--restart "$rp")
     fi
 
-    # Réseaux : mode special (container:xxx = partage la stack d'un autre conteneur, ex. VPN/gluetun)
-    # sinon le premier reseau a la creation, les suivants connectes apres le run.
-    local -a nets=()
+    # Réseau principal : mode spécial (container:xxx = VPN/gluetun, host, none) ou 1er réseau
     local netmode
-    netmode=$(jq -r '.[0].HostConfig.NetworkMode // ""' <<<"$c" 2>/dev/null)
+    netmode=$(_jqv "$c" '.[0].HostConfig.NetworkMode // ""')
     if [[ "$netmode" == container:* ]]; then
-        args+=(--network "$netmode")
+        _a+=(--network "$netmode")
     else
-        while IFS= read -r x; do [[ -n "$x" ]] && nets+=("$x"); done \
-            < <(jq -r '.[0].NetworkSettings.Networks | keys[]?' <<<"$c" 2>/dev/null)
-        [[ ${#nets[@]} -gt 0 ]] && args+=(--network "${nets[0]}")
+        x=$(_jqv "$c" '.[0].NetworkSettings.Networks | keys[0] // ""')
+        [[ -n "$x" ]] && _a+=(--network "$x")
     fi
 
     # Ports publiés (udp inclus)
-    while IFS= read -r x; do [[ -n "$x" ]] && args+=(-p "$x"); done < <(jq -r '
-        .[0].HostConfig.PortBindings // {} | to_entries[] | .key as $cp | .value[]? |
-        ((if (.HostIp // "") != "" and .HostIp != "0.0.0.0" then .HostIp + ":" else "" end)
-         + (.HostPort // "") + ":" + ($cp | split("/")[0])
-         + (if ($cp | test("/udp$")) then "/udp" else "" end))' <<<"$c" 2>/dev/null)
+    _collect _a -p "$c" '.[0].HostConfig.PortBindings // {} | to_entries[] | .key as $cp | .value[]?
+        | ((if (.HostIp // "") != "" and .HostIp != "0.0.0.0" then .HostIp + ":" else "" end)
+           + (.HostPort // "") + ":" + ($cp | split("/")[0])
+           + (if ($cp | test("/udp$")) then "/udp" else "" end))'
 
     # Volumes : .Mounts couvre binds ET volumes nommés (y compris ceux créés via --mount)
-    while IFS= read -r x; do [[ -n "$x" ]] && args+=(-v "$x"); done < <(jq -r '
-        .[0].Mounts // [] | .[] |
-        if   .Type == "bind"   then .Source + ":" + .Destination + (if .RW then "" else ":ro" end)
-        elif .Type == "volume" then (.Name // .Source) + ":" + .Destination + (if .RW then "" else ":ro" end)
-        else empty end' <<<"$c" 2>/dev/null)
-    while IFS= read -r x; do [[ -n "$x" ]] && args+=(--tmpfs "$x"); done \
-        < <(jq -r '.[0].HostConfig.Tmpfs // {} | keys[]?' <<<"$c" 2>/dev/null)
+    _collect _a -v "$c" '.[0].Mounts // [] | .[]
+        | if   .Type == "bind"   then .Source + ":" + .Destination + (if .RW then "" else ":ro" end)
+          elif .Type == "volume" then (.Name // .Source) + ":" + .Destination + (if .RW then "" else ":ro" end)
+          else empty end'
+    _collect _a --tmpfs "$c" '.[0].HostConfig.Tmpfs // {} | keys[]?'
 
-    # Env : seulement celles absentes de l'image (sinon on fige les défauts de l'ancienne version)
-    while IFS= read -r x; do [[ -n "$x" ]] && args+=(-e "$x"); done < <(jq -r --argjson ie "$(jq '.[0].Config.Env // []' <<<"$img")" '
-        .[0].Config.Env // [] | .[] | select(. as $e | ($ie | index($e)) == null)' <<<"$c" 2>/dev/null)
+    # Env et labels : uniquement ce qui diffère de l'image (Traefik & co pour les labels)
+    _collect _a -e "$c" '.[0].Config.Env // [] | .[] | select(. as $e | ($ie | index($e)) == null)' \
+        --argjson ie "$(_jqv "$img" '.[0].Config.Env // []')"
+    _collect _a -l "$c" '.[0].Config.Labels // {} | to_entries[] | select(.value != ($il[.key] // null)) | .key + "=" + .value' \
+        --argjson il "$(_jqv "$img" '.[0].Config.Labels // {}')"
 
-    # Labels : seulement ceux qui diffèrent de l'image (Traefik & co — critiques !)
-    while IFS= read -r x; do [[ -n "$x" ]] && args+=(-l "$x"); done < <(jq -r --argjson il "$(jq '.[0].Config.Labels // {}' <<<"$img")" '
-        .[0].Config.Labels // {} | to_entries[] | select(.value != ($il[.key] // null)) | .key + "=" + .value' <<<"$c" 2>/dev/null)
+    # Capacités, périphériques, hosts, DNS
+    _collect _a --cap-add  "$c" '.[0].HostConfig.CapAdd  // [] | .[]?'
+    _collect _a --cap-drop "$c" '.[0].HostConfig.CapDrop // [] | .[]?'
+    _collect _a --device   "$c" '.[0].HostConfig.Devices // [] | .[]? | .PathOnHost + ":" + .PathInContainer + ":" + .CgroupPermissions'
+    _collect _a --add-host "$c" '.[0].HostConfig.ExtraHosts // [] | .[]?'
+    _collect _a --dns      "$c" '.[0].HostConfig.Dns // [] | .[]?'
 
-    # Identité / TTY / privilèges
-    x=$(jq -r '.[0].Config.User // ""' <<<"$c");  [[ -n "$x" ]] && args+=(-u "$x")
-    x=$(jq -r '.[0].Config.WorkingDir // ""' <<<"$c")
-    [[ -n "$x" && "$x" != "$(jq -r '.[0].Config.WorkingDir // ""' <<<"$img")" ]] && args+=(-w "$x")
-    [[ "$(jq -r '.[0].Config.Tty' <<<"$c")"            == "true" ]] && args+=(-t)
-    [[ "$(jq -r '.[0].Config.OpenStdin' <<<"$c")"      == "true" ]] && args+=(-i)
-    [[ "$(jq -r '.[0].HostConfig.Privileged' <<<"$c")" == "true" ]] && args+=(--privileged)
+    # Identité, TTY, privilèges
+    x=$(_jqv "$c" '.[0].Config.User // ""'); [[ -n "$x" ]] && _a+=(-u "$x")
+    x=$(_jqv "$c" '.[0].Config.WorkingDir // ""')
+    [[ -n "$x" && "$x" != "$(_jqv "$img" '.[0].Config.WorkingDir // ""')" ]] && _a+=(-w "$x")
+    [[ "$(_jqv "$c" '.[0].Config.Tty')"            == "true" ]] && _a+=(-t)
+    [[ "$(_jqv "$c" '.[0].Config.OpenStdin')"      == "true" ]] && _a+=(-i)
+    [[ "$(_jqv "$c" '.[0].HostConfig.Privileged')" == "true" ]] && _a+=(--privileged)
 
     # Limites de ressources
-    x=$(jq -r '.[0].HostConfig.Memory // 0' <<<"$c");    (( x > 0 )) && args+=(--memory "$x")
-    x=$(jq -r '.[0].HostConfig.PidsLimit // 0' <<<"$c"); (( x > 0 )) && args+=(--pids-limit "$x")
-    x=$(jq -r '.[0].HostConfig.NanoCpus // 0' <<<"$c")
-    (( x > 0 )) && args+=(--cpus "$(awk -v n="$x" 'BEGIN{printf "%.3f", n/1000000000}')")
+    x=$(_jqv "$c" '.[0].HostConfig.Memory // 0');    (( x > 0 )) && _a+=(--memory "$x")
+    x=$(_jqv "$c" '.[0].HostConfig.PidsLimit // 0'); (( x > 0 )) && _a+=(--pids-limit "$x")
+    x=$(_jqv "$c" '.[0].HostConfig.NanoCpus // 0')
+    (( x > 0 )) && _a+=(--cpus "$(awk -v n="$x" 'BEGIN{printf "%.3f", n/1000000000}')")
 
-    # Capacités, devices, hosts, dns, log driver
-    while IFS= read -r x; do [[ -n "$x" ]] && args+=(--cap-add  "$x"); done < <(jq -r '.[0].HostConfig.CapAdd  // [] | .[]?' <<<"$c" 2>/dev/null)
-    while IFS= read -r x; do [[ -n "$x" ]] && args+=(--cap-drop "$x"); done < <(jq -r '.[0].HostConfig.CapDrop // [] | .[]?' <<<"$c" 2>/dev/null)
-    while IFS= read -r x; do [[ -n "$x" ]] && args+=(--device   "$x"); done \
-        < <(jq -r '.[0].HostConfig.Devices // [] | .[]? | .PathOnHost + ":" + .PathInContainer + ":" + .CgroupPermissions' <<<"$c" 2>/dev/null)
-    while IFS= read -r x; do [[ -n "$x" ]] && args+=(--add-host "$x"); done < <(jq -r '.[0].HostConfig.ExtraHosts // [] | .[]?' <<<"$c" 2>/dev/null)
-    while IFS= read -r x; do [[ -n "$x" ]] && args+=(--dns      "$x"); done < <(jq -r '.[0].HostConfig.Dns // [] | .[]?' <<<"$c" 2>/dev/null)
-    x=$(jq -r '.[0].HostConfig.LogConfig.Type // ""' <<<"$c")
-    [[ -n "$x" && "$x" != "json-file" ]] && args+=(--log-driver "$x")
+    # Log driver non standard
+    x=$(_jqv "$c" '.[0].HostConfig.LogConfig.Type // ""')
+    [[ -n "$x" && "$x" != "json-file" ]] && _a+=(--log-driver "$x")
 
     # Entrypoint personnalisé (seulement s'il diffère de l'image)
-    local c_ep i_ep
-    c_ep=$(jq -c '.[0].Config.Entrypoint // []' <<<"$c"); i_ep=$(jq -c '.[0].Config.Entrypoint // []' <<<"$img")
-    if [[ "$c_ep" != "$i_ep" ]]; then
-        if [[ "$(jq 'length' <<<"$c_ep")" == "1" ]]; then args+=(--entrypoint "$(jq -r '.[0]' <<<"$c_ep")")
-        else warn "$name : entrypoint personnalise multi-arguments non reproduit ($c_ep)"
+    local c_ep
+    c_ep=$(jq -c '.[0].Config.Entrypoint // []' <<<"$c" 2>/dev/null)
+    if [[ "$c_ep" != "$(jq -c '.[0].Config.Entrypoint // []' <<<"$img" 2>/dev/null)" ]]; then
+        if [[ "$(jq 'length' <<<"$c_ep" 2>/dev/null)" == "1" ]]; then
+            _a+=(--entrypoint "$(jq -r '.[0]' <<<"$c_ep")")
+        else
+            warn "$name : entrypoint multi-arguments non reproduit ($c_ep)"
         fi
     fi
 
-    args+=("$image")
+    _a+=("$image")
 
     # Commande personnalisée (seulement si elle diffère de l'image)
-    local c_cmd i_cmd
-    c_cmd=$(jq -c '.[0].Config.Cmd // []' <<<"$c"); i_cmd=$(jq -c '.[0].Config.Cmd // []' <<<"$img")
-    if [[ "$c_cmd" != "$i_cmd" && "$c_cmd" != "[]" && "$c_cmd" != "null" ]]; then
-        while IFS= read -r x; do args+=("$x"); done < <(jq -r '.[]?' <<<"$c_cmd" 2>/dev/null)
+    local c_cmd
+    c_cmd=$(jq -c '.[0].Config.Cmd // []' <<<"$c" 2>/dev/null)
+    if [[ "$c_cmd" != "$(jq -c '.[0].Config.Cmd // []' <<<"$img" 2>/dev/null)" && "$c_cmd" != "[]" && "$c_cmd" != "null" ]]; then
+        while IFS= read -r x; do _a+=("$x"); done < <(jq -r '.[]?' <<<"$c_cmd" 2>/dev/null)
     fi
+}
 
-    # Ce qu'on ne sait pas reproduire : on prévient au lieu de faire semblant
-    [[ "$(jq '((.[0].HostConfig.Ulimits // []) | length) + ((.[0].HostConfig.Sysctls // {}) | length) + ((.[0].HostConfig.DeviceRequests // []) | length)' <<<"$c" 2>/dev/null)" != "0" ]] \
+# Prévient sur ce que la recréation ne sait pas reproduire (plutôt que de faire semblant).
+_warn_unsupported() {
+    local name=$1 c=$2
+    [[ "$(_jqv "$c" '((.[0].HostConfig.Ulimits // []) | length) + ((.[0].HostConfig.Sysctls // {}) | length) + ((.[0].HostConfig.DeviceRequests // []) | length)')" != "0" ]] \
         && warn "$name : ulimits/sysctls/GPU detectes — NON reproduits par la recreation"
-    [[ "$(jq '[.[0].NetworkSettings.Networks[]? | select(((.Aliases // []) | length) > 0 or (.IPAMConfig // null) != null)] | length' <<<"$c" 2>/dev/null)" != "0" ]] \
+    [[ "$(_jqv "$c" '[.[0].NetworkSettings.Networks[]? | select(((.Aliases // []) | length) > 0 or (.IPAMConfig // null) != null)] | length')" != "0" ]] \
         && warn "$name : alias reseau / IP statique detectes — NON reproduits"
+    return 0
+}
 
-    # --- Bascule sécurisée : on renomme l'ancien, on lance le neuf, rollback si echec ---
+# Bascule sécurisée : renomme l'ancien, lance le neuf, restaure l'ancien si échec.
+_swap_container() {
+    local name=$1; local -n _args=$2
     local old="${name}__old_$$"
+
     docker stop "$name" >/dev/null 2>&1 || true
     if ! docker rename "$name" "$old" >/dev/null 2>&1; then
         warn "$name : rename impossible — recreation abandonnee (conteneur intact)"
@@ -468,17 +483,11 @@ recreate_container() {
         return 1
     fi
 
-    if docker run "${args[@]}" >/dev/null 2>&1; then
+    if docker run "${_args[@]}" >/dev/null 2>&1; then
         docker rm "$old" >/dev/null 2>&1 || true
-        local k
-        for (( k=1; k<${#nets[@]}; k++ )); do
-            docker network connect "${nets[k]}" "$name" >/dev/null 2>&1 \
-                || warn "$name : connexion au reseau ${nets[k]} echouee"
-        done
         return 0
     fi
 
-    # Echec : on restaure l'ancien conteneur
     err "Recreation de $name echouee — restauration de l'ancien conteneur"
     docker rm -f "$name" >/dev/null 2>&1 || true
     if docker rename "$old" "$name" >/dev/null 2>&1; then
@@ -488,7 +497,30 @@ recreate_container() {
     fi
     return 1
 }
-export -f recreate_container
+
+recreate_container() {
+    local name="$1" image="$2"
+    local c img
+    c=$(docker inspect "$name" 2>/dev/null)    || { warn "inspect echoue pour $name"; return 1; }
+    img=$(docker inspect "$image" 2>/dev/null) || img='[{}]'
+
+    # shellcheck disable=SC2034  # args est renseigné via nameref dans _build_run_args/_swap_container
+    local -a args=()
+    _build_run_args args "$name" "$c" "$image" "$img"
+    _warn_unsupported "$name" "$c"
+    _swap_container "$name" args || return 1
+
+    # Réseaux additionnels (le premier a déjà été posé au run)
+    local net first
+    first=$(_jqv "$c" '.[0].NetworkSettings.Networks | keys[0] // ""')
+    while IFS= read -r net; do
+        [[ -z "$net" || "$net" == "$first" ]] && continue
+        docker network connect "$net" "$name" >/dev/null 2>&1 \
+            || warn "$name : connexion au reseau $net echouee"
+    done < <(_jqv "$c" '.[0].NetworkSettings.Networks | keys[]?')
+    return 0
+}
+export -f _jqv _collect _build_run_args _warn_unsupported _swap_container recreate_container
 
 pull_and_restart() {
     local image="$1"
