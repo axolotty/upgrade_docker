@@ -178,6 +178,9 @@ check_requirements() {
     command -v docker &>/dev/null || missing+=("docker")
     command -v xargs  &>/dev/null || missing+=("xargs")
     command -v jq     &>/dev/null || missing+=("jq")
+    # curl porte tout l'interrogatoire des registries : sans lui, chaque image partirait
+    # en echec sans que la cause soit visible
+    command -v curl   &>/dev/null || missing+=("curl")
     ! docker compose version &>/dev/null && missing+=("docker compose plugin")
     if [[ ${#missing[@]} -gt 0 ]]; then
         err "Commandes manquantes : ${missing[*]}"; exit 1
