@@ -395,6 +395,7 @@ _snapshot_digests() {
 
 # _report_stack_updates <tableau assoc d'avant> : logue et alimente UPDATED_IMAGES
 _report_stack_updates() {
+    # shellcheck disable=SC2178  # _snap est un nameref vers un tableau associatif
     local -n _snap=$1
     local img after
     for img in "${!_snap[@]}"; do
