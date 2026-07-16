@@ -60,6 +60,7 @@ sudo upgrade_docker --notify admin@example.com    # mail si échec
 | `--dry-run` | Vérifie les mises à jour sans rien modifier | - |
 | `--parallel N` | Jobs simultanés | 20 |
 | `--timeout N` | Timeout en secondes par pull | 300 |
+| `--health-wait N` | Secondes d'observation d'un conteneur standalone recréé avant de supprimer l'ancien. `0` désactive la vérification | 5 |
 | `--search-dir DIR` | Répertoire à scanner (répétable) | `/opt /home /docker_data` |
 | `--exclude-dir NOM` | **Nom** de dossier à ignorer au scan (répétable) — s'ajoute à `vendor`, `node_modules`, `html/apps`, `.git`, `OLD`. Voir le piège plus bas | - |
 | `--no-prune` | Ne pas supprimer les images obsolètes (`docker image prune -f`) | - |
@@ -87,6 +88,7 @@ SEARCH_DIRS=(/opt /srv)
 PARALLEL=10
 NOTIFY_EMAIL=admin@exemple.fr
 LOG_FILE=/var/log/docker-update.log
+HEALTH_WAIT=5
 ```
 
 Les options passées en **ligne de commande priment** sur ce fichier.
@@ -118,8 +120,10 @@ Les options passées en **ligne de commande priment** sur ce fichier.
   variables d'env, réseau (y compris `network_mode: container:xxx`), limites RAM/CPU/pids,
   devices, capabilities, DNS, log driver, user, workdir, commande et entrypoint
 - **Bascule sécurisée** : l'ancien conteneur est *renommé*, puis supprimé seulement si le
-  `docker run` du nouveau réussit — sinon **rollback automatique** sur l'ancien, qui est
-  restauré sous son nom et redémarré
+  nouveau **démarre et survit** à `--health-wait` secondes d'observation (encore `running`,
+  aucun redémarrage). Dans tous les autres cas — `docker run` en échec, ou conteneur qui
+  démarre puis meurt — **rollback automatique** : l'ancien est restauré sous son nom et
+  redémarré, et l'image fautive n'est pas adoptée
 - Env et labels ne sont réinjectés que s'ils **diffèrent de l'image** : réinjecter ses défauts
   figerait l'ancienne version et annulerait la mise à jour
 - Une image absente de tout registry est **ignorée**, pas comptée en échec — même verdict que
@@ -173,15 +177,26 @@ Et **`--exclude-dir` ne sauve pas** de ce cas : il filtre sur le **nom** du doss
 chemin. `--exclude-dir monsite` exclurait les deux. La seule vraie réponse est de supprimer ou
 de déplacer le doublon.
 
-### ⚠️ Le rollback ne couvre pas « démarre puis meurt »
+### Conteneurs qui sortent vite volontairement
 
-Le rollback se déclenche si `docker run` échoue. Il ne se déclenche **pas** si le conteneur
-démarre puis meurt aussitôt — cas typique d'une nouvelle image qui casse l'application.
-`docker run` a rendu 0, donc le script considère la bascule réussie et **supprime l'ancien
-conteneur** ; le nouveau, lui, boucle sur sa `restart policy`.
+Après avoir recréé un conteneur standalone, le script l'**observe pendant `--health-wait`
+secondes** (5 par défaut) avant de supprimer l'ancien. Il n'est validé que s'il est encore
+`running` et n'a **redémarré aucune fois** ; sinon, rollback.
 
-L'ancienne **image** reste disponible pour revenir en arrière à la main (sauf si `prune` est
-passé par là), mais le conteneur d'origine est perdu.
+C'est nécessaire parce qu'un `docker run` réussi ne prouve rien : il rend 0 dès que le
+conteneur *démarre*. Une image qui casse l'application passe ce test, puis meurt et boucle sur
+sa `restart policy` — l'ancien conteneur aurait alors été supprimé pour rien. Le critère fiable
+est `RestartCount`, car un conteneur en boucle de crash repasse brièvement par `running` mais
+ne peut pas cacher ses redémarrages.
+
+La contrepartie : un conteneur dont le **travail se termine légitimement** pendant la fenêtre
+d'observation (job one-shot, batch qui finit) est vu comme mort et déclenche un rollback à
+tort. Le script ne recrée que des conteneurs qui *tournaient*, ce qui rend le cas rare — mais
+si ça te concerne, `--health-wait 0` désactive la vérification et rétablit l'ancien
+comportement.
+
+Coût : `--health-wait` secondes par conteneur **effectivement recréé**, et rien du tout quand
+il n'y a pas de mise à jour.
 
 ### Recréation standalone : ce qui n'est pas reproduit
 

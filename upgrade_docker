@@ -15,6 +15,9 @@ LOG_FILE="/var/log/docker-update.log"
 MAX_LOG_SIZE=$((5 * 1024 * 1024))
 PULL_TIMEOUT=300
 PARALLEL=20
+# Delai d'observation apres recreation d'un conteneur standalone : `docker run` rend 0
+# des que le conteneur demarre, meme s'il meurt aussitot. 0 desactive la verification.
+HEALTH_WAIT=5
 SEARCH_DIRS=()
 EXCLUDE_DIRS=()         # --exclude-dir  : dossiers à ignorer au scan (en plus des défauts)
 DRY_RUN=false
@@ -73,6 +76,7 @@ Options:
   --dry-run                  Vérifie les mises à jour sans rien modifier
   --parallel N               Jobs simultanés                       [défaut: $PARALLEL]
   --timeout N                Timeout en secondes par pull          [défaut: $PULL_TIMEOUT]
+  --health-wait N            Observation apres recreation (0=off)  [défaut: $HEALTH_WAIT]
   --search-dir DIR           Répertoire à scanner (répétable)      [défaut: /opt /home /docker_data]
   --exclude-dir NOM          Dossier à ignorer au scan (répétable)
                              [toujours ignorés: vendor, node_modules, html/apps, .git, OLD]
@@ -116,6 +120,7 @@ while [[ $# -gt 0 ]]; do
         --force-reboot)     FORCE_REBOOT=true ;;
         --parallel)         PARALLEL="${2:?'--parallel attend un nombre'}"; shift ;;
         --timeout)          PULL_TIMEOUT="${2:?'--timeout attend un nombre'}"; shift ;;
+        --health-wait)      HEALTH_WAIT="${2:?'--health-wait attend un nombre de secondes'}"; shift ;;
         --search-dir)       SEARCH_DIRS+=("${2:?'--search-dir attend un chemin'}"); shift ;;
         --exclude-dir)      EXCLUDE_DIRS+=("${2:?'--exclude-dir attend un nom de dossier'}"); shift ;;
         --exclude)          EXCLUDE_IMAGES+=("${2:?'--exclude attend une image'}"); shift ;;
@@ -634,6 +639,33 @@ _warn_unsupported() {
 }
 
 # Bascule sécurisée : renomme l'ancien, lance le neuf, restaure l'ancien si échec.
+# Le conteneur tient-il debout apres HEALTH_WAIT secondes ?
+# `docker run` rend 0 des que le conteneur DEMARRE : une image qui casse l'application
+# passe ce test, puis meurt et boucle sur sa restart policy. On ne recree que des
+# conteneurs qui tournaient : en attendre autant du nouveau est donc legitime.
+# RestartCount > 0 est le signal fiable — un crash-loop repasse brievement par
+# « running », mais il ne peut pas cacher ses redemarrages.
+_container_survives() {
+    local name="$1" wait_s="$2"
+    [[ "$wait_s" -le 0 ]] && return 0          # verification desactivee
+    sleep "$wait_s"
+    local status restarts
+    status=$(docker inspect --format='{{.State.Status}}'  "$name" 2>/dev/null) || return 1
+    restarts=$(docker inspect --format='{{.RestartCount}}' "$name" 2>/dev/null) || return 1
+    [[ "$status" == "running" && "${restarts:-1}" -eq 0 ]]
+}
+
+# Restaure l'ancien conteneur (renomme en $old) a la place du nouveau
+_rollback_container() {
+    local name="$1" old="$2"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    if docker rename "$old" "$name" >/dev/null 2>&1; then
+        docker start "$name" >/dev/null 2>&1 && log "   [ROLLBACK] $name restaure sur l'ancienne image"
+    else
+        err "$name : rollback impossible ! Ancien conteneur conserve sous le nom $old"
+    fi
+}
+
 _swap_container() {
     local name=$1; local -n _args=$2
     local old="${name}__old_$$"
@@ -645,19 +677,20 @@ _swap_container() {
         return 1
     fi
 
-    if docker run "${_args[@]}" >/dev/null 2>&1; then
-        docker rm "$old" >/dev/null 2>&1 || true
-        return 0
+    if ! docker run "${_args[@]}" >/dev/null 2>&1; then
+        err "Recreation de $name echouee — restauration de l'ancien conteneur"
+        _rollback_container "$name" "$old"
+        return 1
     fi
 
-    err "Recreation de $name echouee — restauration de l'ancien conteneur"
-    docker rm -f "$name" >/dev/null 2>&1 || true
-    if docker rename "$old" "$name" >/dev/null 2>&1; then
-        docker start "$name" >/dev/null 2>&1 && log "   [ROLLBACK] $name restaure sur l'ancienne image"
-    else
-        err "$name : rollback impossible ! Ancien conteneur conserve sous le nom $old"
+    if ! _container_survives "$name" "$HEALTH_WAIT"; then
+        err "$name : demarre puis mort sur la nouvelle image — restauration de l'ancien conteneur"
+        _rollback_container "$name" "$old"
+        return 1
     fi
-    return 1
+
+    docker rm "$old" >/dev/null 2>&1 || true
+    return 0
 }
 
 recreate_container() {
@@ -682,7 +715,8 @@ recreate_container() {
     done < <(_jqv "$c" '.[0].NetworkSettings.Networks | keys[]?')
     return 0
 }
-export -f _jqv _collect _build_run_args _warn_unsupported _swap_container recreate_container
+export -f _jqv _collect _build_run_args _warn_unsupported _container_survives _rollback_container _swap_container recreate_container
+export HEALTH_WAIT
 
 pull_and_restart() {
     local image="$1"
