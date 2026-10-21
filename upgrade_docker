@@ -1,1085 +1,168 @@
 #!/bin/bash
-# upgrade_docker — Mise à jour automatique des images Docker
-
-[[ "${BASH_SOURCE[0]}" == "$0" ]] || { echo "Ne pas sourcer ce script." >&2; return 1; }
-
+# upgrade_docker — met à jour les conteneurs QUI TOURNENT (stacks Compose + standalone)
+#
+#   --dry-run          liste les mises à jour disponibles, ne touche à rien
+#   --image IMAGE      ne traite que les stacks/conteneurs qui utilisent cette image
+#   --exclude NOM      ignore une stack, un conteneur ou une image (répétable)
+#   --compose-only     stacks Compose uniquement
+#   --standalone-only  conteneurs standalone uniquement
+#   --no-build         ne reconstruit pas les services 'build:' (même si leur base a bougé)
+#   --force-reboot     recrée les stacks même sans nouvelle image
+#   --no-prune         garde les images obsolètes
+#   --timeout N        timeout d'un pull, en secondes, par stack ou image   [600]
+#   --log FILE         fichier de log                     [/var/log/docker-update.log]
+#   --notify EMAIL     mail en cas d'échec (nécessite 'mail')
+#   --help             cette aide
+#
+# À lancer en root : les stacks Portainer vivent dans un volume non lisible sinon.
 set -uo pipefail
 
-# --- Cleanup -----------------------------------------------------------------
-_TMPFILES=()
-_cleanup() { rm -f "${_TMPFILES[@]}" 2>/dev/null; }
-trap _cleanup EXIT INT TERM
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit "${1:-0}"; }
 
-# --- Configuration par défaut ------------------------------------------------
-LOG_FILE="/var/log/docker-update.log"
-MAX_LOG_SIZE=$((5 * 1024 * 1024))
-PULL_TIMEOUT=300
-PARALLEL=20
-# Delai d'observation apres recreation d'un conteneur standalone : `docker run` rend 0
-# des que le conteneur demarre, meme s'il meurt aussitot. 0 desactive la verification.
-HEALTH_WAIT=5
-SEARCH_DIRS=()
-EXCLUDE_DIRS=()         # --exclude-dir  : dossiers à ignorer au scan (en plus des défauts)
-DRY_RUN=false
-NO_PRUNE=false
-NO_BUILD=false          # --no-build     : ne pas reconstruire les services Compose 'build:'
-COMPOSE_ONLY=false
-STANDALONE_ONLY=false
-FORCE_PULL=false        # --force        : retélécharge toutes les images
-FORCE_REBOOT=false      # --force-reboot : redémarre conteneurs même si image inchangée
-NOTIFY_EMAIL=""
-EXCLUDE_IMAGES=()
-SINGLE_IMAGE=""
-
-_CONF_LOADED=""
-
-# --- Fichier de configuration (optionnel) -------------------------------------
-# Permet de figer ses propres défauts sans les retaper à chaque fois :
-#   EXCLUDE_DIRS=(vieille-stack archive)   SEARCH_DIRS=(/opt /srv)
-#   PARALLEL=10   NOTIFY_EMAIL=admin@exemple.fr   LOG_FILE=/var/log/docker-update.log
-# Les options passées en ligne de commande priment sur ce fichier.
-for _conf in /etc/upgrade_docker.conf "${XDG_CONFIG_HOME:-$HOME/.config}/upgrade_docker.conf"; do
-    if [[ -f "$_conf" ]]; then
-        # shellcheck source=/dev/null
-        source "$_conf" || { echo "Erreur : configuration illisible : $_conf" >&2; exit 1; }
-        _CONF_LOADED="$_conf"
-    fi
-done
-
-START_TIME=$SECONDS
-
-UPDATED_IMAGES=()
-FAILED_IMAGES=()
-SKIPPED=()
-
-TOTAL_DOWNLOAD_BYTES=0
-TOTAL_NEW_SIZE_BYTES=0
-TOTAL_PRUNE_BYTES=0
-
-# --- Couleurs (TTY uniquement) ------------------------------------------------
-if [[ -t 1 ]]; then
-    C_RESET='\033[0m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
-    C_RED='\033[0;31m'; C_BOLD='\033[1m'
-else
-    C_RESET=''; C_GREEN=''; C_YELLOW=''; C_RED=''; C_BOLD=''
-fi
-
-# --- Aide --------------------------------------------------------------------
-usage() {
-    cat <<EOF
-Usage: $(basename "$0") [OPTIONS]
-
-  Par défaut le script applique les mises à jour. Utilisez --dry-run pour
-  inspecter sans modifier.
-
-Options:
-  --dry-run                  Vérifie les mises à jour sans rien modifier
-  --parallel N               Jobs simultanés                       [défaut: $PARALLEL]
-  --timeout N                Timeout en secondes par pull          [défaut: $PULL_TIMEOUT]
-  --health-wait N            Observation apres recreation (0=off)  [défaut: $HEALTH_WAIT]
-  --search-dir DIR           Répertoire à scanner (répétable)      [défaut: /opt /home /docker_data]
-  --exclude-dir NOM          Dossier à ignorer au scan (répétable)
-                             [toujours ignorés: vendor, node_modules, html/apps, .git, OLD]
-  --no-prune                 Ne pas supprimer les images obsolètes
-  --no-build                 Ne pas reconstruire les services Compose avec 'build:'
-                             (par défaut : reconstruit UNIQUEMENT si l'image de base a une MAJ)
-  --compose-only             Traite uniquement les stacks Compose
-  --standalone-only          Traite uniquement les images standalone
-  --force                    Traite aussi les images déjà à jour (effet visible en --dry-run :
-                             elles sont signalées [FORCE] ; en mode normal tout est déjà pullé)
-  --force-reboot             Recrée les conteneurs même si le digest n'a pas changé
-  --exclude IMAGE            Exclut une image (répétable)
-  --image IMAGE              Traite uniquement cette image
-  --notify EMAIL             Envoie un mail en cas d'échec (nécessite 'mail')
-  --log FILE                 Fichier de log                        [défaut: $LOG_FILE]
-  --help                     Affiche cette aide
-
-Configuration (optionnelle) : /etc/upgrade_docker.conf ou ~/.config/upgrade_docker.conf
-  Permet de figer ses défauts, ex. :  EXCLUDE_DIRS=(vieille-stack archive)
-  Les options ci-dessus priment sur le fichier de config.
-
-Exemples:
-  $(basename "$0") --dry-run
-  $(basename "$0") --parallel 5 --notify admin@example.com
-  $(basename "$0") --image nginx:latest
-  $(basename "$0") --exclude redis:7 --force
-  $(basename "$0") --search-dir /srv --compose-only
-EOF
-    exit 0
-}
-
-# --- Arguments ---------------------------------------------------------------
-while [[ $# -gt 0 ]]; do
+DRY_RUN=false PRUNE=true BUILD=true FORCE_REBOOT=false COMPOSE=true STANDALONE=true
+IMAGE="" TIMEOUT=600 NOTIFY_EMAIL="" LOG_FILE=/var/log/docker-update.log EXCLUDE=() FAILED=()
+while (($#)); do
     case $1 in
-        --dry-run)          DRY_RUN=true ;;
-        --no-prune)         NO_PRUNE=true ;;
-        --no-build)         NO_BUILD=true ;;
-        --compose-only)     COMPOSE_ONLY=true ;;
-        --standalone-only)  STANDALONE_ONLY=true ;;
-        --force)            FORCE_PULL=true ;;
-        --force-reboot)     FORCE_REBOOT=true ;;
-        --parallel)         PARALLEL="${2:?'--parallel attend un nombre'}"; shift ;;
-        --timeout)          PULL_TIMEOUT="${2:?'--timeout attend un nombre'}"; shift ;;
-        --health-wait)      HEALTH_WAIT="${2:?'--health-wait attend un nombre de secondes'}"; shift ;;
-        --search-dir)       SEARCH_DIRS+=("${2:?'--search-dir attend un chemin'}"); shift ;;
-        --exclude-dir)      EXCLUDE_DIRS+=("${2:?'--exclude-dir attend un nom de dossier'}"); shift ;;
-        --exclude)          EXCLUDE_IMAGES+=("${2:?'--exclude attend une image'}"); shift ;;
-        --image)            SINGLE_IMAGE="${2:?'--image attend une image'}"; shift ;;
-        --notify)           NOTIFY_EMAIL="${2:?'--notify attend un email'}"; shift ;;
-        --log)              LOG_FILE="${2:?'--log attend un chemin'}"; shift ;;
-        --help|-h)          usage ;;
-        *) echo "Option inconnue : $1 — lancez avec --help" >&2; exit 1 ;;
+        --dry-run)         DRY_RUN=true ;;
+        --no-prune)        PRUNE=false ;;
+        --no-build)        BUILD=false ;;
+        --force-reboot)    FORCE_REBOOT=true ;;
+        --compose-only)    STANDALONE=false ;;
+        --standalone-only) COMPOSE=false ;;
+        --image)           IMAGE="${2:?--image attend une image}"; shift ;;
+        --exclude)         EXCLUDE+=("${2:?--exclude attend un nom}"); shift ;;
+        --timeout)         TIMEOUT="${2:?--timeout attend un nombre}"; shift ;;
+        --log)             LOG_FILE="${2:?--log attend un chemin}"; shift ;;
+        --notify)          NOTIFY_EMAIL="${2:?--notify attend un email}"; shift ;;
+        --help|-h)         usage ;;
+        *) echo "Option inconnue : $1" >&2; usage 1 ;;
     esac
     shift
 done
+$COMPOSE || $STANDALONE || { echo "--compose-only et --standalone-only sont exclusifs" >&2; exit 1; }
 
-[[ ${#SEARCH_DIRS[@]} -eq 0 ]] && SEARCH_DIRS=("/opt" "/home" "/docker_data")
+touch "$LOG_FILE" 2>/dev/null && exec > >(tee -a "$LOG_FILE") 2>&1
+log() { echo "[$(date '+%F %T')] $*"; }
 
-if $COMPOSE_ONLY && $STANDALONE_ONLY; then
-    echo "Erreur : --compose-only et --standalone-only sont mutuellement exclusifs." >&2
-    exit 1
-fi
+# Vrai si l'un des noms (stack, conteneur, image) est exclu
+excluded() { local n e; for n; do for e in "${EXCLUDE[@]}"; do [[ $n == "$e" ]] && return 0; done; done; return 1; }
+# Vrai si --image est absent, ou si l'une des images listées y correspond (tag :latest implicite)
+wanted() { [[ -z $IMAGE ]] && return 0; local i; for i; do [[ $i == "$IMAGE" || $i:latest == "$IMAGE" || $i == "$IMAGE:latest" ]] && return 0; done; return 1; }
 
-# --- Logging -----------------------------------------------------------------
-_setup_logging() {
-    local log_dir
-    log_dir=$(dirname "$LOG_FILE")
-    if [[ ! -d "$log_dir" ]]; then
-        echo "Erreur : répertoire de log inexistant : $log_dir" >&2; exit 1
+# Stacks Portainer : leurs labels donnent /data/compose/N, chemin vu DEPUIS le conteneur Portainer
+PORTAINER_DATA=$(docker volume inspect -f '{{.Mountpoint}}' portainer_data 2>/dev/null)
+host_path() { [[ $1 == /data/* && ! -e $1 && -n $PORTAINER_DATA ]] && echo "$PORTAINER_DATA${1#/data}" || echo "$1"; }
+
+# Vrai si le registry a un digest absent de l'image locale. Utilise les identifiants docker.
+# Résultat mis en cache : Docker Hub répond 429 si on l'interroge trop (bases partagées).
+declare -A SEEN=()
+has_update() {
+    [[ -v SEEN[$1] ]] && return "${SEEN[$1]}"
+    local local_digests remote rc=1
+    local_digests=$(docker image inspect -f '{{join .RepoDigests " "}}' "$1" 2>/dev/null)
+    if [[ -z $local_digests ]]; then
+        :   # image absente localement : rien à comparer
+    elif ! remote=$(docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}' 2>&1); then
+        # Absente du registry (avec nos identifiants) = image buildée localement : silence
+        [[ $remote == *"does not exist"* || $remote == *"not found"* ]] \
+            || log "  [?] $1 : non vérifiable — ${remote##*: }"
+    elif [[ $local_digests != *"$remote"* ]]; then
+        rc=0
     fi
-    if { [[ -f "$LOG_FILE" ]] && [[ ! -w "$LOG_FILE" ]]; } ||
-       { [[ ! -f "$LOG_FILE" ]] && [[ ! -w "$log_dir" ]]; }; then
-        echo "Erreur : impossible d'écrire dans $LOG_FILE" >&2; exit 1
-    fi
-    if [[ -f "$LOG_FILE" && $(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) -ge $MAX_LOG_SIZE ]]; then
-        mv "$LOG_FILE" "${LOG_FILE}.$(date '+%Y%m%d_%H%M%S').bak"
-        find "$(dirname "$LOG_FILE")" -maxdepth 1 -name "$(basename "$LOG_FILE").*.bak" -mtime +30 -delete 2>/dev/null || true
-    fi
-    exec > >(tee -a "$LOG_FILE") 2>&1
-}
-_setup_logging
-
-log()  { echo -e "${C_BOLD}[$(date '+%H:%M:%S')]${C_RESET} $*"; }
-warn() { echo -e "${C_YELLOW}[$(date '+%H:%M:%S')] [WARN]${C_RESET} $*" >&2; }
-err()  { echo -e "${C_RED}[$(date '+%H:%M:%S')] [FAIL]${C_RESET} $*" >&2; }
-
-# --- Formatage de taille (pure bash) -----------------------------------------
-format_bytes() {
-    local bytes=$1
-    if   (( bytes >= 1073741824 )); then
-        printf "%d.%d Go" $(( bytes / 1073741824 )) $(( (bytes % 1073741824) * 10 / 1073741824 ))
-    elif (( bytes >= 1048576    )); then
-        printf "%d.%d Mo" $(( bytes / 1048576 ))    $(( (bytes % 1048576)    * 10 / 1048576    ))
-    elif (( bytes >= 1024       )); then
-        printf "%d Ko"    $(( bytes / 1024 ))
-    else
-        printf "%d o"     "$bytes"
-    fi
+    SEEN[$1]=$rc
+    return $rc
 }
 
-# --- Prérequis ---------------------------------------------------------------
-check_requirements() {
-    local missing=()
-    command -v docker &>/dev/null || missing+=("docker")
-    command -v xargs  &>/dev/null || missing+=("xargs")
-    command -v jq     &>/dev/null || missing+=("jq")
-    # curl porte tout l'interrogatoire des registries : sans lui, chaque image partirait
-    # en echec sans que la cause soit visible
-    command -v curl   &>/dev/null || missing+=("curl")
-    ! docker compose version &>/dev/null && missing+=("docker compose plugin")
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        err "Commandes manquantes : ${missing[*]}"; exit 1
-    fi
-    ! docker manifest inspect --help &>/dev/null 2>&1 && export DOCKER_CLI_EXPERIMENTAL=enabled
-    [[ $EUID -ne 0 ]] && warn "Non exécuté en root — certaines opérations peuvent échouer"
-    # 'compose pull' sort en erreur sur les services buildables : on l'ignore si l'option existe
-    _PULL_OPTS=()
-    docker compose pull --help 2>&1 | grep -q -- '--ignore-buildable' && _PULL_OPTS=(--ignore-buildable)
-    return 0
-}
-
-# --- Dry-run wrapper ---------------------------------------------------------
-run() {
-    if $DRY_RUN; then log "   [DRY-RUN] $*"
-    else "$@"
-    fi
-}
-
-# =============================================================================
-# DRY-RUN : vérification parallèle + estimation de taille réelle
-# =============================================================================
-# Types de manifest acceptés. Exportés : les helpers tournent dans les sous-shells xargs.
-export MANIFEST_ACCEPT="application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json"
-export PLATFORM_ACCEPT="application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json"
-
-# Découpe un nom d'image en « registry<TAB>repo<TAB>tag ».
-# Un « : » n'introduit un tag que si rien ne le suit jusqu'au prochain « / » : sinon
-# c'est un port (registry.local:5000/app).
-_parse_image_ref() {
-    local image="$1" ref tag registry repo first
-    if [[ "$image" == *:* && "${image##*:}" != */* ]]; then
-        tag="${image##*:}"; ref="${image%:*}"
-    else
-        tag="latest"; ref="$image"
-    fi
-    first="${ref%%/*}"
-    if [[ "$first" == *.* || "$first" == *:* || "$first" == "localhost" ]]; then
-        registry="$first"; repo="${ref#*/}"
-    else
-        # Aucun registry dans le nom : Docker Hub, espace « library/ » si image officielle
-        registry="index.docker.io"
-        [[ "$ref" == */* ]] && repo="$ref" || repo="library/$ref"
-    fi
-    printf '%s\t%s\t%s\n' "$registry" "$repo" "$tag"
-}
-
-# Jeton d'accès en lecture au registry, sur stdout (vide si anonyme ou indisponible)
-_registry_token() {
-    local registry="$1" repo="$2" probe_url="$3"
-    case "$registry" in
-        index.docker.io)
-            curl -4 -s --max-time 10 \
-                "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" \
-                2>/dev/null | jq -r '.token // ""' 2>/dev/null
-            ;;
-        ghcr.io|lscr.io)
-            curl -4 -s --max-time 10 \
-                "https://ghcr.io/token?service=ghcr.io&scope=repository:${repo}:pull" \
-                2>/dev/null | jq -r '.token // .access_token // ""' 2>/dev/null
-            ;;
-        *)
-            # Registry quelconque : le défi www-authenticate indique où demander le jeton
-            local www_auth realm service token_url
-            www_auth=$(curl -4 -s -L --max-time 10 -o /dev/null -D - "$probe_url" 2>/dev/null \
-                | grep -i "^www-authenticate:" | head -1)
-            realm=$(printf '%s' "$www_auth" | grep -oP 'realm="[^"]+"' | cut -d'"' -f2)
-            [[ -z "$realm" ]] && return 0
-            service=$(printf '%s' "$www_auth" | grep -oP 'service="[^"]+"' | cut -d'"' -f2)
-            token_url="${realm}?scope=repository:${repo}:pull"
-            [[ -n "$service" ]] && token_url+="&service=${service}"
-            curl -4 -s --max-time 10 "$token_url" 2>/dev/null \
-                | jq -r '.token // .access_token // ""' 2>/dev/null
-            ;;
-    esac
-}
-
-# Récupère un manifest et renseigne <var_code> <var_digest> <var_body> (passées par nom)
-_fetch_manifest() {
-    local url="$1" accept="$2" token="$3"
-    local -n _o_code="$4" _o_digest="$5" _o_body="$6"
-    local args=(-4 -s -L --max-time 15 -H "Accept: $accept")
-    [[ -n "$token" ]] && args+=(-H "Authorization: Bearer $token")
-
-    local tmp_h tmp_body
-    tmp_h=$(mktemp); tmp_body=$(mktemp)
-    _o_code=$(curl "${args[@]}" -D "$tmp_h" -o "$tmp_body" -w "%{http_code}" "$url" 2>/dev/null)
-    _o_body=$(cat "$tmp_body" 2>/dev/null)
-    _o_digest=$(grep -i "^docker-content-digest:" "$tmp_h" | grep -oP 'sha256:[a-f0-9]+' | head -1)
-    rm -f "$tmp_h" "$tmp_body"
-}
-
-# Volume réel à télécharger : somme des layers du manifest de la plateforme locale
-_manifest_size() {
-    local manifest="$1" repo_url="$2" token="$3" os="$4" arch="$5" variant="$6"
-    local size=0
-
-    if ! jq -e '.manifests' <<<"$manifest" >/dev/null 2>&1; then
-        # Manifest mono-architecture : les layers sont déjà là
-        jq '[.layers[].size] | add // 0' <<<"$manifest" 2>/dev/null || echo 0
-        return
-    fi
-
-    # Manifest-list : suivre le manifest correspondant à la plateforme locale
-    local platform_digest
-    # shellcheck disable=SC2016  # $os/$arch/$variant sont des variables jq (--arg), pas shell
-    platform_digest=$(jq -r --arg os "$os" --arg arch "$arch" --arg variant "$variant" \
-        '[ .manifests[]
-           | select(.platform.os == $os and .platform.architecture == $arch
-                    and (if $variant == "" then true else (.platform.variant // "") == $variant end))
-           | .digest ][0] // .manifests[0].digest // ""' <<<"$manifest" 2>/dev/null)
-    [[ -z "$platform_digest" ]] && { echo 0; return; }
-
-    # pm_code/pm_digest inutiles ici : seul le corps du manifest nous intéresse
-    # shellcheck disable=SC2034  # renseignées par nom (nameref) dans _fetch_manifest
-    local pm pm_code pm_digest
-    _fetch_manifest "${repo_url}/${platform_digest}" "$PLATFORM_ACCEPT" "$token" pm_code pm_digest pm
-    size=$(jq '[.layers[].size] | add // 0' <<<"$pm" 2>/dev/null || echo 0)
-    echo "${size:-0}"
-}
-
-# Sortie : LOCAL|OK|UPDATE|FAILED <image> [champs...]
-check_image_dry_run() {
-    local image="$1"
-
-    # Sans RepoDigest, l'image n'a pas d'origine distante (construite localement)
-    local local_digest
-    local_digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$image" 2>/dev/null || echo "none")
-    [[ -z "$local_digest" || "$local_digest" == "none" ]] && { echo "LOCAL $image"; return; }
-
-    local local_size local_os local_arch local_variant inspect_out
-    inspect_out=$(docker inspect --format='{{.Size}}	{{.Os}}	{{.Architecture}}	{{.Variant}}' "$image" 2>/dev/null)
-    IFS=$'\t' read -r local_size local_os local_arch local_variant <<< "$inspect_out"
-    local_size="${local_size:-0}"; local_os="${local_os:-linux}"; local_arch="${local_arch:-amd64}"
-
-    local registry repo tag
-    IFS=$'\t' read -r registry repo tag < <(_parse_image_ref "$image")
-
-    # lscr.io n'est qu'un alias de distribution : l'API registry, elle, vit sur ghcr.io
-    local api_host="$registry"
-    [[ "$registry" == "lscr.io" ]] && api_host="ghcr.io"
-    local repo_url="https://${api_host}/v2/${repo}/manifests"
-
-    local token
-    token=$(_registry_token "$registry" "$repo" "${repo_url}/${tag}")
-
-    local http_code remote_digest manifest
-    _fetch_manifest "${repo_url}/${tag}" "$MANIFEST_ACCEPT" "$token" http_code remote_digest manifest
-
-    # Image absente du registry :
-    #   - 404 : standard
-    #   - 401 sur index.docker.io avec token : Docker Hub retourne 401 (pas 404) pour tout
-    #     ce qui n'existe pas dans library/ (espace des images officielles, toujours publiques)
-    #   - body MANIFEST_UNKNOWN/NAME_UNKNOWN : variante selon le registry
-    if [[ "$http_code" == "404" ]] || \
-       [[ "$http_code" == "401" && "$registry" == "index.docker.io" && -n "$token" ]] || \
-       grep -qE '"(MANIFEST_UNKNOWN|NAME_UNKNOWN)"' <<<"$manifest" 2>/dev/null; then
-        echo "LOCAL $image"; return
-    fi
-    [[ -z "$manifest" || -z "$remote_digest" ]] && { echo "FAILED $image"; return; }
-
-    # À jour : on s'arrête là, sauf --force (qui doit afficher la taille)
-    local forced=false
-    if [[ "$local_digest" == *"$remote_digest"* ]]; then
-        [[ "${FORCE_PULL:-false}" != "true" ]] && { echo "OK $image $local_size"; return; }
-        forced=true
-    fi
-
-    local remote_size
-    remote_size=$(_manifest_size "$manifest" "$repo_url" "$token" "$local_os" "$local_arch" "$local_variant")
-    echo "UPDATE $image $local_size ${remote_size:-0} ${local_digest##*@} $remote_digest $forced"
-}
-export -f _parse_image_ref _registry_token _fetch_manifest _manifest_size check_image_dry_run
-export FORCE_PULL
-
-run_dry_run_checks() {
-    local -n _upd=$1
-    local -n _fail=$2
-    shift 2
-    local -a images=("$@")
-
-    [[ ${#images[@]} -eq 0 ]] && { log "Aucune image à vérifier."; return; }
-    log "Vérification de ${#images[@]} image(s) en parallèle (x${PARALLEL})..."
-    echo ""
-
-    local tmpfile; tmpfile=$(mktemp); _TMPFILES+=("$tmpfile")
-
-    printf '%s\n' "${images[@]}" | xargs -P"$PARALLEL" -I{} bash -c 'check_image_dry_run "$@"' _ {} > "$tmpfile"
-    sort -k2,2 -o "$tmpfile" "$tmpfile"
-
-    while IFS= read -r line; do
-        read -r status image rest <<< "$line"
-        case $status in
-            UPDATE)
-                read -r local_size remote_size local_digest_short remote_digest is_forced <<< "$rest"
-                if [[ "$is_forced" == "true" ]]; then
-                    log "${C_YELLOW}[FORCE]${C_RESET} $image — force (deja a jour)"
-                else
-                    log "${C_YELLOW}[UPDATE]${C_RESET} $image"
-                fi
-                log "   Taille actuelle  : $(format_bytes "${local_size:-0}")"
-                log "   A telecharger    : $(format_bytes "${remote_size:-0}") (compresse)"
-                log "   Digest local     : ${local_digest_short:-n/a}"
-                log "   Digest distant   : ${remote_digest:-n/a}"
-                _upd+=("$image")
-                TOTAL_DOWNLOAD_BYTES=$(( TOTAL_DOWNLOAD_BYTES + ${remote_size:-0} ))
-                TOTAL_NEW_SIZE_BYTES=$(( TOTAL_NEW_SIZE_BYTES + ${remote_size:-0} ))
-                TOTAL_PRUNE_BYTES=$(( TOTAL_PRUNE_BYTES + ${local_size:-0} ))
-                ;;
-            LOCAL)
-                log "[LOCAL] $image — image locale (pas de registry, ignorée)"
-                SKIPPED+=("$image (locale)")
-                _LOCAL_IMAGES["$image"]=1
-                ;;
-            FAILED)
-                warn "$image — digest distant inaccessible"
-                _fail+=("$image (digest inaccessible)")
-                ;;
-            OK)
-                log "${C_GREEN}[OK]${C_RESET} $image — deja a jour"
-                ;;
-        esac
-    done < "$tmpfile"
-}
-
-# --- Estimation dangling -----------------------------------------------------
-estimate_prune_size() {
-    docker images --filter "dangling=true" --format "{{.Size}}" 2>/dev/null | awk '
-        function to_bytes(s) {
-            if (s ~ /GB/) { gsub(/GB/,"",s); return s * 1073741824 }
-            if (s ~ /MB/) { gsub(/MB/,"",s); return s * 1048576 }
-            if (s ~ /kB/) { gsub(/kB/,"",s); return s * 1024 }
-            return s+0
-        }
-        { total += to_bytes($1) }
-        END { print total+0 }
-    '
-}
-
-# --- Suivi des mises à jour d'une stack Compose --------------------------------
-# 'compose pull' ne dit pas quelles images ont bougé : on releve les digests avant/après.
-
-# _snapshot_digests <tableau assoc> <composefile>
-_snapshot_digests() {
-    local -n _snap=$1
-    local img
-    _snap=()
-    while IFS= read -r img; do
-        [[ -z "$img" ]] && continue
-        [[ "$img" == *:* ]] || img="${img}:latest"
-        _snap["$img"]=$(docker inspect --format='{{index .RepoDigests 0}}' "$img" 2>/dev/null || echo "none")
-    done < <(docker compose -f "$2" config --images 2>/dev/null || true)
-}
-
-# _report_stack_updates <tableau assoc d'avant> : logue et alimente UPDATED_IMAGES
-# Renvoie 0 si au moins une image de la stack a change (c'est ce qui autorise le 'up -d')
-_report_stack_updates() {
-    # shellcheck disable=SC2178  # _snap est un nameref vers un tableau associatif
-    local -n _snap=$1
-    local img after
-    local changed=1
-    for img in "${!_snap[@]}"; do
-        after=$(docker inspect --format='{{index .RepoDigests 0}}' "$img" 2>/dev/null || echo "none")
-        if [[ "${_snap[$img]}" != "$after" ]]; then
-            log "   ${C_YELLOW}[UPDATE]${C_RESET} $img"
-            UPDATED_IMAGES+=("$img")
-            changed=0
-        fi
+# Conteneurs qui tournent sur une image plus vieille que celle que porte leur tag
+stale() {
+    local c
+    for c; do
+        [[ $(docker inspect -f '{{.Image}}' "$c") != \
+           $(docker image inspect -f '{{.Id}}' "$(docker inspect -f '{{.Config.Image}}' "$c")" 2>/dev/null) ]] \
+            && { local n; n=$(docker inspect -f '{{.Name}}' "$c"); echo "${n#/}"; }
     done
-    return $changed
 }
 
-# --- Stacks qui construisent leurs images (build:) -----------------------------
-# "service|contexte|dockerfile" pour chaque service Compose qui construit son image.
-_compose_build_services() {
-    docker compose -f "$1" config --format json 2>/dev/null \
-        | jq -r '.services | to_entries[] | select(.value.build != null)
-                 | .key + "|" + (.value.build.context // ".") + "|" + (.value.build.dockerfile // "Dockerfile")' 2>/dev/null
-}
-
-# Met à jour les images de BASE des services build:, et renvoie 0 si au moins une a bougé
-# (⇒ il faut reconstruire). Si toutes les bases sont à jour : on ne reconstruit pas — ce
-# script met à jour des IMAGES, il ne redéploie pas le code local (pour ça : up -d --build).
-#
-# NB : on pull la base EXPLICITEMENT car `compose build --pull` ne rafraîchit pas le tag
-#      local (BuildKit la garde dans son propre cache) : la base serait alors vue comme
-#      périmée à chaque exécution et on reconstruirait indéfiniment.
-_update_build_bases() {
-    local bs svc ctx df base st need=1
-    for bs in "$@"; do
-        IFS='|' read -r svc ctx df <<< "$bs"
-        [[ "$df" != /* ]] && df="$ctx/$df"
-        while IFS= read -r base; do
-            [[ -z "$base" ]] && continue
-            [[ "$base" == *:* ]] || base="${base}:latest"
-            st=$(check_image_dry_run "$base" | awk '{print $1}')
-            case "$st" in
-                UPDATE)
-                    log "   [BUILD] $svc — base $base : ${C_YELLOW}mise a jour disponible${C_RESET}"
-                    if timeout "$PULL_TIMEOUT" docker pull "$base" >/dev/null 2>&1; then
-                        need=0
-                        UPDATED_IMAGES+=("$base (base de $svc)")
-                    else
-                        warn "$svc : pull de la base $base echoue"
-                    fi
-                    ;;
-                OK) log "   [BUILD] $svc — base $base : ${C_GREEN}deja a jour${C_RESET}" ;;
-                *)  log "   [BUILD] $svc — base $base : non verifiable ($st)" ;;
-            esac
-        done < <(_dockerfile_bases "$df")
-    done
+# Services 'build:' : pull les images de base (FROM) qui ont une MAJ ; vrai s'il faut rebuild.
+# Pas de rebuild sinon : on met à jour des images, on ne redéploie pas le code local.
+bases_updated() {
+    local df base need=1
+    while read -r df; do
+        while read -r base; do
+            has_update "$base" || continue
+            log "  [BASE] $base : mise à jour disponible"
+            if $DRY_RUN || timeout "$TIMEOUT" docker pull -q "$base" >/dev/null; then need=0
+            else FAILED+=("pull:$base"); fi
+        done < <(awk 'tolower($1) == "from" {
+                    i = ($2 ~ /^--/) ? 3 : 2; img = $i
+                    if (tolower($(i+1)) == "as") st[tolower($(i+2))] = 1
+                    if (!(tolower(img) in st) && img !~ /\$/ && img != "scratch") print img
+                 }' "$df" 2>/dev/null | sort -u)
+    done < <(docker compose "$@" config --format json 2>/dev/null | jq -r '.services[].build | select(.)
+             | (.dockerfile // "Dockerfile") as $d | if ($d | startswith("/")) then $d else .context + "/" + $d end')
     return $need
 }
 
-# Images de base (FROM) d'un Dockerfile : ignore les stages multi-étapes, les ARG et scratch.
-_dockerfile_bases() {
-    [[ -f "$1" ]] || return 0
-    awk '
-        tolower($1) == "from" {
-            img = $2
-            if (tolower($3) == "as") stages[tolower($4)] = 1
-            if (tolower(img) in stages) next     # FROM <stage precedent>
-            if (img ~ /\$/)             next     # FROM ${ARG} : non resolvable
-            if (tolower(img) == "scratch") next
-            print img
-        }
-    ' "$1" | sort -u
-}
-
-# =============================================================================
-# MODE NORMAL : pull + récréation de conteneur
-# =============================================================================
-
-# --- Recréation d'un conteneur standalone -------------------------------------
-# Reconstruit `docker run` depuis l'inspect du conteneur. Deux principes :
-#  - on ne réinjecte que ce qui DIFFÈRE de l'image (env, labels, cmd, entrypoint) :
-#    réinjecter ses défauts figerait l'ancienne version et annulerait la mise à jour ;
-#  - l'ancien conteneur est RENOMMÉ (pas supprimé) : si le run échoue, on le restaure.
-
-# Valeur scalaire d'un filtre jq (chaîne vide si absent).
-_jqv() { jq -r "$2" <<<"$1" 2>/dev/null; }
-
-# Ajoute "<flag> <valeur>" au tableau pour chaque ligne non vide produite par le filtre.
-#   _collect <tableau> <flag> <json> <filtre> [args jq supplémentaires...]
-_collect() {
-    local -n _arr=$1
-    local flag=$2 json=$3 filter=$4; shift 4
-    local line
-    while IFS= read -r line; do
-        [[ -n "$line" ]] && _arr+=("$flag" "$line")
-    done < <(jq -r "$@" "$filter" <<<"$json" 2>/dev/null)
-}
-
-# Construit les arguments de `docker run`.  _build_run_args <tableau> <nom> <json_conteneur> <image> <json_image>
-_build_run_args() {
-    local -n _a=$1
-    local name=$2 c=$3 image=$4 img=$5
-    local x
-    _a=(-d --name "$name")
-
-    # Politique de redémarrage
-    local rp rc
-    rp=$(_jqv "$c" '.[0].HostConfig.RestartPolicy.Name // ""')
-    rc=$(_jqv "$c" '.[0].HostConfig.RestartPolicy.MaximumRetryCount // 0')
-    if   [[ "$rp" == "on-failure" && "$rc" -gt 0 ]]; then _a+=(--restart "on-failure:$rc")
-    elif [[ -n "$rp" && "$rp" != "no" ]];           then _a+=(--restart "$rp")
-    fi
-
-    # Réseau principal : mode spécial (container:xxx = VPN/gluetun, host, none) ou 1er réseau
-    local netmode
-    netmode=$(_jqv "$c" '.[0].HostConfig.NetworkMode // ""')
-    if [[ "$netmode" == container:* ]]; then
-        _a+=(--network "$netmode")
-    else
-        x=$(_jqv "$c" '.[0].NetworkSettings.Networks | keys[0] // ""')
-        [[ -n "$x" ]] && _a+=(--network "$x")
-    fi
-
-    # Ports publiés (udp inclus)
-    # shellcheck disable=SC2016  # $cp est une variable jq, elle ne doit pas être expansée par le shell
-    _collect _a -p "$c" '.[0].HostConfig.PortBindings // {} | to_entries[] | .key as $cp | .value[]?
-        | ((if (.HostIp // "") != "" and .HostIp != "0.0.0.0" then .HostIp + ":" else "" end)
-           + (.HostPort // "") + ":" + ($cp | split("/")[0])
-           + (if ($cp | test("/udp$")) then "/udp" else "" end))'
-
-    # Volumes : .Mounts couvre binds ET volumes nommés (y compris ceux créés via --mount)
-    _collect _a -v "$c" '.[0].Mounts // [] | .[]
-        | if   .Type == "bind"   then .Source + ":" + .Destination + (if .RW then "" else ":ro" end)
-          elif .Type == "volume" then (.Name // .Source) + ":" + .Destination + (if .RW then "" else ":ro" end)
-          else empty end'
-    _collect _a --tmpfs "$c" '.[0].HostConfig.Tmpfs // {} | keys[]?'
-
-    # Env et labels : uniquement ce qui diffère de l'image (Traefik & co pour les labels)
-    # shellcheck disable=SC2016  # $e/$ie/$il sont des variables jq (--argjson), pas shell
-    _collect _a -e "$c" '.[0].Config.Env // [] | .[] | select(. as $e | ($ie | index($e)) == null)' \
-        --argjson ie "$(_jqv "$img" '.[0].Config.Env // []')"
-    # shellcheck disable=SC2016  # idem : $il est passé à jq via --argjson
-    _collect _a -l "$c" '.[0].Config.Labels // {} | to_entries[] | select(.value != ($il[.key] // null)) | .key + "=" + .value' \
-        --argjson il "$(_jqv "$img" '.[0].Config.Labels // {}')"
-
-    # Capacités, périphériques, hosts, DNS
-    _collect _a --cap-add  "$c" '.[0].HostConfig.CapAdd  // [] | .[]?'
-    _collect _a --cap-drop "$c" '.[0].HostConfig.CapDrop // [] | .[]?'
-    _collect _a --device   "$c" '.[0].HostConfig.Devices // [] | .[]? | .PathOnHost + ":" + .PathInContainer + ":" + .CgroupPermissions'
-    _collect _a --add-host "$c" '.[0].HostConfig.ExtraHosts // [] | .[]?'
-    _collect _a --dns      "$c" '.[0].HostConfig.Dns // [] | .[]?'
-
-    # Identité, TTY, privilèges
-    x=$(_jqv "$c" '.[0].Config.User // ""'); [[ -n "$x" ]] && _a+=(-u "$x")
-    x=$(_jqv "$c" '.[0].Config.WorkingDir // ""')
-    [[ -n "$x" && "$x" != "$(_jqv "$img" '.[0].Config.WorkingDir // ""')" ]] && _a+=(-w "$x")
-    [[ "$(_jqv "$c" '.[0].Config.Tty')"            == "true" ]] && _a+=(-t)
-    [[ "$(_jqv "$c" '.[0].Config.OpenStdin')"      == "true" ]] && _a+=(-i)
-    [[ "$(_jqv "$c" '.[0].HostConfig.Privileged')" == "true" ]] && _a+=(--privileged)
-
-    # Limites de ressources
-    x=$(_jqv "$c" '.[0].HostConfig.Memory // 0');    (( x > 0 )) && _a+=(--memory "$x")
-    x=$(_jqv "$c" '.[0].HostConfig.PidsLimit // 0'); (( x > 0 )) && _a+=(--pids-limit "$x")
-    x=$(_jqv "$c" '.[0].HostConfig.NanoCpus // 0')
-    (( x > 0 )) && _a+=(--cpus "$(awk -v n="$x" 'BEGIN{printf "%.3f", n/1000000000}')")
-
-    # Log driver non standard
-    x=$(_jqv "$c" '.[0].HostConfig.LogConfig.Type // ""')
-    [[ -n "$x" && "$x" != "json-file" ]] && _a+=(--log-driver "$x")
-
-    # Entrypoint personnalisé (seulement s'il diffère de l'image)
-    local c_ep
-    c_ep=$(jq -c '.[0].Config.Entrypoint // []' <<<"$c" 2>/dev/null)
-    if [[ "$c_ep" != "$(jq -c '.[0].Config.Entrypoint // []' <<<"$img" 2>/dev/null)" ]]; then
-        if [[ "$(jq 'length' <<<"$c_ep" 2>/dev/null)" == "1" ]]; then
-            _a+=(--entrypoint "$(jq -r '.[0]' <<<"$c_ep")")
-        else
-            warn "$name : entrypoint multi-arguments non reproduit ($c_ep)"
-        fi
-    fi
-
-    _a+=("$image")
-
-    # Commande personnalisée (seulement si elle diffère de l'image)
-    local c_cmd
-    c_cmd=$(jq -c '.[0].Config.Cmd // []' <<<"$c" 2>/dev/null)
-    if [[ "$c_cmd" != "$(jq -c '.[0].Config.Cmd // []' <<<"$img" 2>/dev/null)" && "$c_cmd" != "[]" && "$c_cmd" != "null" ]]; then
-        while IFS= read -r x; do _a+=("$x"); done < <(jq -r '.[]?' <<<"$c_cmd" 2>/dev/null)
-    fi
-}
-
-# Prévient sur ce que la recréation ne sait pas reproduire (plutôt que de faire semblant).
-_warn_unsupported() {
-    local name=$1 c=$2
-    [[ "$(_jqv "$c" '((.[0].HostConfig.Ulimits // []) | length) + ((.[0].HostConfig.Sysctls // {}) | length) + ((.[0].HostConfig.DeviceRequests // []) | length)')" != "0" ]] \
-        && warn "$name : ulimits/sysctls/GPU detectes — NON reproduits par la recreation"
-    [[ "$(_jqv "$c" '[.[0].NetworkSettings.Networks[]? | select(((.Aliases // []) | length) > 0 or (.IPAMConfig // null) != null)] | length')" != "0" ]] \
-        && warn "$name : alias reseau / IP statique detectes — NON reproduits"
-    return 0
-}
-
-# Bascule sécurisée : renomme l'ancien, lance le neuf, restaure l'ancien si échec.
-# Le conteneur tient-il debout apres HEALTH_WAIT secondes ?
-# `docker run` rend 0 des que le conteneur DEMARRE : une image qui casse l'application
-# passe ce test, puis meurt et boucle sur sa restart policy. On ne recree que des
-# conteneurs qui tournaient : en attendre autant du nouveau est donc legitime.
-# RestartCount > 0 est le signal fiable — un crash-loop repasse brievement par
-# « running », mais il ne peut pas cacher ses redemarrages.
-_container_survives() {
-    local name="$1" wait_s="$2"
-    [[ "$wait_s" -le 0 ]] && return 0          # verification desactivee
-    sleep "$wait_s"
-    local status restarts
-    status=$(docker inspect --format='{{.State.Status}}'  "$name" 2>/dev/null) || return 1
-    restarts=$(docker inspect --format='{{.RestartCount}}' "$name" 2>/dev/null) || return 1
-    [[ "$status" == "running" && "${restarts:-1}" -eq 0 ]]
-}
-
-# Restaure l'ancien conteneur (renomme en $old) a la place du nouveau
-_rollback_container() {
-    local name="$1" old="$2"
-    docker rm -f "$name" >/dev/null 2>&1 || true
-    if docker rename "$old" "$name" >/dev/null 2>&1; then
-        docker start "$name" >/dev/null 2>&1 && log "   [ROLLBACK] $name restaure sur l'ancienne image"
-    else
-        err "$name : rollback impossible ! Ancien conteneur conserve sous le nom $old"
-    fi
-}
-
-_swap_container() {
-    local name=$1; local -n _args=$2
-    local old="${name}__old_$$"
-
-    docker stop "$name" >/dev/null 2>&1 || true
-    if ! docker rename "$name" "$old" >/dev/null 2>&1; then
-        warn "$name : rename impossible — recreation abandonnee (conteneur intact)"
-        docker start "$name" >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    if ! docker run "${_args[@]}" >/dev/null 2>&1; then
-        err "Recreation de $name echouee — restauration de l'ancien conteneur"
-        _rollback_container "$name" "$old"
-        return 1
-    fi
-
-    if ! _container_survives "$name" "$HEALTH_WAIT"; then
-        err "$name : demarre puis mort sur la nouvelle image — restauration de l'ancien conteneur"
-        _rollback_container "$name" "$old"
-        return 1
-    fi
-
-    docker rm "$old" >/dev/null 2>&1 || true
-    return 0
-}
-
-recreate_container() {
-    local name="$1" image="$2"
-    local c img
-    c=$(docker inspect "$name" 2>/dev/null)    || { warn "inspect echoue pour $name"; return 1; }
-    img=$(docker inspect "$image" 2>/dev/null) || img='[{}]'
-
-    # shellcheck disable=SC2034  # args est renseigné via nameref dans _build_run_args/_swap_container
-    local -a args=()
-    _build_run_args args "$name" "$c" "$image" "$img"
-    _warn_unsupported "$name" "$c"
-    _swap_container "$name" args || return 1
-
-    # Réseaux additionnels (le premier a déjà été posé au run)
-    local net first
-    first=$(_jqv "$c" '.[0].NetworkSettings.Networks | keys[0] // ""')
-    while IFS= read -r net; do
-        [[ -z "$net" || "$net" == "$first" ]] && continue
-        docker network connect "$net" "$name" >/dev/null 2>&1 \
-            || warn "$name : connexion au reseau $net echouee"
-    done < <(_jqv "$c" '.[0].NetworkSettings.Networks | keys[]?')
-    return 0
-}
-export -f _jqv _collect _build_run_args _warn_unsupported _container_survives _rollback_container _swap_container recreate_container
-export HEALTH_WAIT
-
-pull_and_restart() {
-    local image="$1"
-    local force_reboot="$2"
-    local timeout_val="$3"
-
-    local digest_before
-    digest_before=$(docker inspect --format='{{index .RepoDigests 0}}' "$image" 2>/dev/null || echo "none")
-
-    # IMPORTANT : lister les conteneurs AVANT le pull. Apres le pull, le tag pointe sur la
-    # nouvelle image et 'ancestor=' ne retrouve plus les conteneurs (restes sur l'ancienne).
-    local containers
-    containers=$(docker ps --filter "ancestor=$image" --format "{{.Names}}" | tr '\n' ' ')
-
-    if ! timeout "$timeout_val" docker pull "$image" >/dev/null 2>&1; then
-        # Pull impossible : image construite localement, ou vrai echec ?
-        # Une image issue d'un build porte quand meme un RepoDigest : seul le registry
-        # fait foi. On delegue au verdict du dry-run pour que les deux modes s'accordent —
-        # sinon le dry-run annonce [LOCAL] et le run reel compte un echec.
-        if [[ "$(check_image_dry_run "$image" | awk '{print $1}')" == "LOCAL" ]]; then
-            echo "SKIPPED_LOCAL $image"; return
-        fi
-        echo "PULL_FAILED $image"; return
-    fi
-
-    local digest_after
-    digest_after=$(docker inspect --format='{{index .RepoDigests 0}}' "$image" 2>/dev/null || echo "none")
-
-    if [[ "$digest_before" != "$digest_after" || "$force_reboot" == "true" ]]; then
-        if [[ -n "${containers// }" ]]; then
-            echo "UPDATED $image $containers"
-        else
-            echo "UPDATED_NO_CONTAINERS $image"
-        fi
-    else
-        echo "ALREADY_UP_TO_DATE $image"
-    fi
-}
-export -f pull_and_restart
-
-# =============================================================================
-# RÉSUMÉ
-# =============================================================================
-print_summary() {
-    local elapsed=$(( SECONDS - START_TIME ))
-    local elapsed_str
-    (( elapsed >= 60 )) && elapsed_str="$((elapsed/60))m$((elapsed%60))s" || elapsed_str="${elapsed}s"
-
-    # Label des flags actifs
-    local flags=""
-    $DRY_RUN         && flags+=" [DRY-RUN]"
-    $FORCE_PULL      && flags+=" [FORCE-PULL]"
-    $FORCE_REBOOT    && flags+=" [FORCE-REBOOT]"
-
-    echo ""
-    echo "════════════════════════════════════════════════════════"
-    log "${C_BOLD}[RESUME]${flags}${C_RESET}"
-    echo "════════════════════════════════════════════════════════"
-
-    if [[ ${#UPDATED_IMAGES[@]} -gt 0 ]]; then
-        local -a _uniq
-        mapfile -t _uniq < <(printf '%s\n' "${UPDATED_IMAGES[@]}" | sort -u)
-        if $DRY_RUN; then
-            log "${C_YELLOW}[UPDATE]${C_RESET} Images a mettre a jour (${#_uniq[@]}) :"
-        else
-            log "${C_YELLOW}[UPDATE]${C_RESET} Images mises a jour (${#_uniq[@]}) :"
-        fi
-        printf '   . %s\n' "${_uniq[@]}"
-    else
-        log "${C_GREEN}[OK]${C_RESET} Toutes les images sont a jour"
-    fi
-
-    if [[ ${#FAILED_IMAGES[@]} -gt 0 ]]; then
-        log "${C_RED}[FAIL]${C_RESET} Echecs (${#FAILED_IMAGES[@]}) :"
-        printf '   . %s\n' "${FAILED_IMAGES[@]}"
-    fi
-
-    if [[ ${#SKIPPED[@]} -gt 0 ]]; then
-        log "[SKIP] Ignorees (${#SKIPPED[@]}) :"
-        printf '   . %s\n' "${SKIPPED[@]}"
-    fi
-
-    # Estimation taille (dry-run uniquement)
-    if $DRY_RUN && [[ ${#UPDATED_IMAGES[@]} -gt 0 ]]; then
-        local existing_dangling net
-        existing_dangling=$(estimate_prune_size)
-        local total_prune=$(( TOTAL_PRUNE_BYTES + existing_dangling ))
-        net=$(( TOTAL_NEW_SIZE_BYTES - TOTAL_PRUNE_BYTES ))
-        echo ""
-        echo "  +-------------------------------------------+"
-        printf "  | %-22s %18s |\n" "A telecharger"   "$(format_bytes "$TOTAL_DOWNLOAD_BYTES")"
-        printf "  | %-22s %18s |\n" "Nouvelles images" "$(format_bytes "$TOTAL_NEW_SIZE_BYTES")"
-        printf "  | %-22s %18s |\n" "Libere (prune)"   "$(format_bytes "$total_prune")"
-        echo "  +-------------------------------------------+"
-        if (( net >= 0 )); then
-            printf "  | %-22s %17s + |\n" "Bilan espace" "$(format_bytes "$net")"
-        else
-            printf "  | %-22s %17s - |\n" "Bilan espace" "$(format_bytes "$(( -net ))")"
-        fi
-        echo "  +-------------------------------------------+"
-    fi
-
-    echo ""
-    if [[ ${#FAILED_IMAGES[@]} -eq 0 ]]; then
-        log "${C_GREEN}[OK]${C_RESET} Termine avec succes a $(date '+%H:%M:%S') (duree: ${elapsed_str})"
-    else
-        warn "Termine avec ${#FAILED_IMAGES[@]} erreur(s) a $(date '+%H:%M:%S') (duree: ${elapsed_str})"
-    fi
-
-    if [[ -n "$NOTIFY_EMAIL" && ${#FAILED_IMAGES[@]} -gt 0 ]]; then
-        if command -v mail &>/dev/null; then
-            printf 'Echecs lors de la mise a jour Docker :\n%s\n' "${FAILED_IMAGES[*]}" | mail -s "[FAIL] docker-update: echecs" "$NOTIFY_EMAIL"
-            log "[MAIL] Notification envoyee a $NOTIFY_EMAIL"
-        else
-            warn "'mail' non disponible — notification impossible"
-        fi
-    fi
-}
-
-# =============================================================================
-# MAIN
-# =============================================================================
-_flags=""
-$DRY_RUN         && _flags+=" [DRY-RUN]"
-$COMPOSE_ONLY    && _flags+=" [COMPOSE-ONLY]"
-$STANDALONE_ONLY && _flags+=" [STANDALONE-ONLY]"
-$FORCE_PULL      && _flags+=" [FORCE-PULL]"
-$FORCE_REBOOT    && _flags+=" [FORCE-REBOOT]"
-$NO_PRUNE        && _flags+=" [NO-PRUNE]"
-
-log "=== Démarrage $(date '+%Y-%m-%d %H:%M:%S')${_flags} ==="
-log "    parallel=${PARALLEL}  timeout=${PULL_TIMEOUT}s  search-dirs=${SEARCH_DIRS[*]}"
-[[ -n "$_CONF_LOADED" ]]          && log "    config=${_CONF_LOADED}"
-[[ ${#EXCLUDE_DIRS[@]} -gt 0 ]]   && log "    dossiers exclus=${EXCLUDE_DIRS[*]}"
-[[ ${#EXCLUDE_IMAGES[@]} -gt 0 ]] && log "    exclusions=${EXCLUDE_IMAGES[*]}"
-[[ -n "$SINGLE_IMAGE" ]]          && log "    image cible=${SINGLE_IMAGE}"
-
-check_requirements
-
-declare -A compose_images
-declare -A _dry_checked    # déduplication inter-stacks en dry-run
-declare -A _LOCAL_IMAGES   # images locales détectées (sans registry)
-
-is_excluded() {
-    local img="$1"
-    for exc in "${EXCLUDE_IMAGES[@]+"${EXCLUDE_IMAGES[@]}"}"; do
-        [[ "$img" == "$exc" ]] && return 0
-    done
-    return 1
-}
-
-# =============================================================================
-# 1. Stacks Docker Compose
-# =============================================================================
-if ! $STANDALONE_ONLY; then
-    echo ""
-    log "=== 1/3 — Stacks Docker Compose ==="
-
-    _compose_dry_list=()
-    declare -A _dg_before=()      # digests des images d'une stack avant son pull
-
-    # Exclusions du scan : dépendances, archives (OLD) et dossiers demandés via --exclude-dir
-    _find_excl=()
-    for _d in vendor node_modules "html/apps" .git OLD "${EXCLUDE_DIRS[@]+"${EXCLUDE_DIRS[@]}"}"; do
-        _find_excl+=(-not -path "*/$_d/*")
-    done
-
-    while IFS= read -r composefile; do
-        dir=$(dirname "$composefile")
-        log "[DIR] $dir"
-
-        # Si --image est spécifié, ne traiter que les stacks qui contiennent cette image
-        if [[ -n "$SINGLE_IMAGE" ]]; then
-            _stack_has_image=false
-            while IFS= read -r img; do
-                [[ "$img" == "$SINGLE_IMAGE" || "${img}:latest" == "$SINGLE_IMAGE" ]] && _stack_has_image=true && break
-            done < <(docker compose -f "$composefile" config --images 2>/dev/null || true)
-            $_stack_has_image || { log "   [SKIP] Stack ignoree (image cible absente)"; continue; }
-        fi
-
-        # Collecte toutes les images (déduplication standalone + liste dry-run)
-        while IFS= read -r img; do
-            [[ -z "$img" ]] && continue
-            compose_images["$img"]=1
-            [[ "$img" != *:* ]] && compose_images["${img}:latest"]=1
-            if $DRY_RUN; then
-                is_excluded "$img" && continue
-                [[ "$img" == *:* ]] || img="${img}:latest"
-                [[ -v _dry_checked["$img"] ]] && continue
-                _dry_checked["$img"]=1
-                _compose_dry_list+=("$img")
-            fi
-        done < <(docker compose -f "$composefile" config --images 2>/dev/null || true)
-
-        # Services qui CONSTRUISENT leur image : la base doit être re-pullée puis l'image rebuild
-        _builds=()
-        while IFS= read -r _bs; do [[ -n "$_bs" ]] && _builds+=("$_bs"); done \
-            < <(_compose_build_services "$composefile")
-
-        if $DRY_RUN; then
-            # En dry-run : on vérifie les images de BASE des Dockerfile (FROM ...)
-            for _bs in "${_builds[@]+"${_builds[@]}"}"; do
-                IFS='|' read -r _svc _ctx _df <<< "$_bs"
-                [[ "$_df" != /* ]] && _df="$_ctx/$_df"
-                while IFS= read -r _base; do
-                    [[ -z "$_base" ]] && continue
-                    is_excluded "$_base" && continue
-                    [[ "$_base" == *:* ]] || _base="${_base}:latest"
-                    log "   [BUILD] $_svc — image de base : $_base"
-                    [[ -v _dry_checked["$_base"] ]] && continue
-                    _dry_checked["$_base"]=1
-                    _compose_dry_list+=("$_base")
-                done < <(_dockerfile_bases "$_df")
-            done
-            continue
-        fi
-
-        # Reconstruction UNIQUEMENT si une image de base a une MAJ (sinon on ne touche à rien)
-        _rebuilt=false
-        if [[ ${#_builds[@]} -gt 0 ]]; then
-            if $NO_BUILD; then
-                log "   [BUILD] ${#_builds[@]} service(s) buildable(s) — ignore (--no-build)"
-            elif _update_build_bases "${_builds[@]}" || $FORCE_PULL || $FORCE_REBOOT; then
-                # base déjà pullée ci-dessus : pas de --pull ici (il ne rafraîchit pas le tag local)
-                log "   [BUILD] Reconstruction de ${#_builds[@]} service(s) sur la nouvelle base"
-                if (cd "$dir" && docker compose build 2>&1 | sed 's/^/   /'); then
-                    _rebuilt=true
-                else
-                    warn "Echec du 'build' pour $dir"
-                    FAILED_IMAGES+=("compose-build:$dir")
-                fi
-            else
-                log "   [BUILD] Images de base a jour — ${C_GREEN}aucune reconstruction${C_RESET}"
-            fi
-        fi
-
-        # Empreinte avant pull, pour pouvoir rapporter ce qui a réellement bougé
-        _snapshot_digests _dg_before "$composefile"
-
-        # --ignore-buildable : sans ça, 'pull' sort en erreur sur les services build: (stack vue en echec)
-        if (cd "$dir" && docker compose pull "${_PULL_OPTS[@]+"${_PULL_OPTS[@]}"}" 2>&1 | sed 's/^/   /'); then
-            # 'up -d' UNIQUEMENT si quelque chose a bouge. Le lancer a chaque passage n'est pas
-            # neutre : il demarre une stack volontairement eteinte, applique une derive de
-            # config jamais deployee, et Compose recree systematiquement les services en
-            # 'network_mode: service:X' — soit un redemarrage a chaque run pour rien.
-            _changed=false
-            _report_stack_updates _dg_before && _changed=true
-            $_rebuilt && _changed=true
-
-            if ! $_changed && ! $FORCE_REBOOT; then
-                log "   [OK] Rien de nouveau — ${C_GREEN}stack laissee en l'etat${C_RESET}"
-            elif (cd "$dir" && docker compose up -d --remove-orphans 2>&1 | sed 's/^/   /'); then
-                log "   [OK] Stack demarree"
-                if $FORCE_REBOOT; then
-                    log "   [FORCE-REBOOT] Recreation forcee de tous les services"
-                    (cd "$dir" && docker compose up -d --force-recreate 2>&1 | sed 's/^/   /')
-                fi
-            else
-                warn "Echec du 'up -d' pour $dir"
-                FAILED_IMAGES+=("compose:$dir")
-            fi
-        else
-            warn "Echec du 'pull' pour $dir"
-            FAILED_IMAGES+=("compose:$dir")
-        fi
-
-    done < <(find "${SEARCH_DIRS[@]}" \
-        \( -name "docker-compose.yml" -o -name "docker-compose.yaml" \) \
-        "${_find_excl[@]}" \
-        2>/dev/null | sort)
-
-    if $DRY_RUN && [[ ${#_compose_dry_list[@]} -gt 0 ]]; then
-        run_dry_run_checks UPDATED_IMAGES FAILED_IMAGES "${_compose_dry_list[@]}"
-    fi
-
-else
-    log "=== 1/3 — Stacks Docker Compose [SKIP: --standalone-only] ==="
-fi
-
-# =============================================================================
-# 2. Images standalone
-# =============================================================================
-if ! $COMPOSE_ONLY; then
-    echo ""
-    log "=== 2/3 — Images standalone ==="
-
-    standalone_images=()
-
-    if [[ -n "$SINGLE_IMAGE" ]]; then
-        standalone_images=("$SINGLE_IMAGE")
-    else
-        while IFS= read -r image; do
-            if [[ -v compose_images["$image"] ]]; then
-                [[ ! -v _LOCAL_IMAGES["$image"] ]] && SKIPPED+=("$image (Compose)")
-            elif is_excluded "$image"; then
-                log "[SKIP] $image — exclue"
-                SKIPPED+=("$image (exclue)")
-            else
-                standalone_images+=("$image")
-            fi
-        done < <(docker images --format "{{.Repository}}:{{.Tag}}" | grep -v "<none>" | sort -u)
-    fi
+log "=== Démarrage$($DRY_RUN && echo ' [DRY-RUN]') ==="
+
+# --- Stacks Compose : découvertes via les labels des conteneurs qui tournent ---
+$COMPOSE && while IFS='|' read -r -u3 proj files envs; do
+    mapfile -t ids < <(docker ps -q --filter "label=com.docker.compose.project=$proj")
+    mapfile -t imgs < <(docker inspect -f '{{.Config.Image}}' "${ids[@]}" | sort -u)
+    wanted "${imgs[@]}" || continue
+    excluded "$proj" && { log "[SKIP] $proj (exclue)"; continue; }
+
+    args=(-p "$proj")
+    IFS=, read -ra f <<<"$files"; for x in "${f[@]}"; do args+=(-f "$(host_path "$x")"); done
+    IFS=, read -ra f <<<"$envs";  for x in "${f[@]}"; do args+=(--env-file "$(host_path "$x")"); done
+    [[ -r ${args[3]} ]] || { log "[SKIP] $proj : ${args[3]} illisible (lancer en root ?)"; FAILED+=("compose:$proj"); continue; }
+
+    log "[STACK] $proj"
+    rebuild=false
+    if ! $BUILD; then :
+    elif bases_updated "${args[@]}" || $FORCE_REBOOT; then rebuild=true; fi
 
     if $DRY_RUN; then
-        run_dry_run_checks UPDATED_IMAGES FAILED_IMAGES "${standalone_images[@]+"${standalone_images[@]}"}"
-    else
-        if [[ ${#standalone_images[@]} -gt 0 ]]; then
-            tmpfile=$(mktemp); _TMPFILES+=("$tmpfile")
-
-            printf '%s\n' "${standalone_images[@]}" | xargs -P"$PARALLEL" -I{} bash -c 'pull_and_restart "$@"' _ {} "$FORCE_REBOOT" "$PULL_TIMEOUT" > "$tmpfile"
-
-            while IFS= read -r line; do
-                read -r status image rest <<< "$line"
-                case $status in
-                    PULL_FAILED)
-                        warn "Pull echoue ou timeout : $image"
-                        FAILED_IMAGES+=("$image")
-                        ;;
-                    SKIPPED_LOCAL)
-                        log "[LOCAL] $image — image locale (pas de registry, ignorée)"
-                        SKIPPED+=("$image (locale)")
-                        ;;
-                    UPDATED)
-                        log "${C_YELLOW}[UPDATE]${C_RESET} $image — mis a jour"
-                        UPDATED_IMAGES+=("$image")
-                        for container in $rest; do
-                            log "   [>] Recreation de : $container"
-                            recreate_container "$container" "$image" || warn "Recreation de $container echouee"
-                        done
-                        ;;
-                    UPDATED_NO_CONTAINERS)
-                        log "${C_YELLOW}[UPDATE]${C_RESET} $image — mis a jour (aucun conteneur actif)"
-                        UPDATED_IMAGES+=("$image")
-                        ;;
-                    ALREADY_UP_TO_DATE)
-                        log "${C_GREEN}[OK]${C_RESET} $image — deja a jour"
-                        ;;
-                esac
-            done < "$tmpfile"
-        else
-            log "Aucune image standalone a traiter."
-        fi
+        for c in $(stale "${ids[@]}"); do log "  [À RECRÉER] $c : tourne sur une ancienne image"; done
+        for img in "${imgs[@]}"; do has_update "$img" && log "  [UPDATE] $img"; done
+        continue
     fi
 
-else
-    log "=== 2/3 — Images standalone [SKIP: --compose-only] ==="
-fi
+    timeout "$TIMEOUT" docker compose "${args[@]}" pull -q --ignore-buildable || { FAILED+=("pull:$proj"); continue; }
+    if $rebuild && ! docker compose "${args[@]}" build -q; then FAILED+=("build:$proj"); continue; fi
 
-# =============================================================================
-# 3. Nettoyage
-# =============================================================================
-echo ""
-if $NO_PRUNE; then
-    log "=== 3/3 — Nettoyage [SKIP: --no-prune] ==="
-else
-    log "=== 3/3 — Nettoyage ==="
-    run docker image prune -f
-fi
+    # 'up -d' seulement si un conteneur a changé d'image : sinon Compose recrée quand même
+    # les services en network_mode: service:X (redémarrage pour rien à chaque passage)
+    mapfile -t old < <(stale $(docker compose "${args[@]}" ps -q))
+    if $FORCE_REBOOT; then
+        log "  [FORCE-REBOOT] recréation de toute la stack"
+        docker compose "${args[@]}" up -d --force-recreate || FAILED+=("up:$proj")
+    elif ((${#old[@]})); then
+        log "  [UPDATE] ${old[*]}"
+        docker compose "${args[@]}" up -d || FAILED+=("up:$proj")
+    fi
+done 3< <(docker ps --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.config_files"}}|{{.Label "com.docker.compose.project.environment_file"}}' \
+          | awk -F'|' '$1 != ""' | sort -u)
 
-print_summary
+# --- Standalone : pull + signalement. Pas de recréation : un `docker run` reconstruit
+# depuis l'inspect perd toujours un réglage. Mettez-les en Compose pour l'automatiser.
+# ponytail: Portainer est le seul concerné ici ; recréation auto si ça se multiplie.
+$STANDALONE && while read -r -u3 name proj; do
+    [[ -n $proj || $name == buildx_buildkit_* ]] && continue
+    img=$(docker inspect -f '{{.Config.Image}}' "$name")
+    wanted "$img" || continue
+    excluded "$name" "$img" && { log "[SKIP] $name (exclu)"; continue; }
+    if $DRY_RUN; then
+        has_update "$img" && log "[UPDATE] $name ($img)"
+    else
+        timeout "$TIMEOUT" docker pull -q "$img" >/dev/null || { FAILED+=("pull:$img"); continue; }
+    fi
+    [[ -n $(stale "$name") ]] && log "[À RECRÉER] $name : tourne sur une ancienne image de $img (recréation manuelle)"
+done 3< <(docker ps --format '{{.Names}} {{.Label "com.docker.compose.project"}}')
 
-[[ ${#FAILED_IMAGES[@]} -eq 0 ]]
+$PRUNE && ! $DRY_RUN && docker image prune -f
+
+((${#FAILED[@]})) || { log "=== OK ==="; exit 0; }
+log "=== ÉCHECS : ${FAILED[*]} ==="
+[[ -n $NOTIFY_EMAIL ]] && printf '%s\n' "${FAILED[@]}" | mail -s "[FAIL] upgrade_docker" "$NOTIFY_EMAIL"
+exit 1

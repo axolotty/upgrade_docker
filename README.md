@@ -1,29 +1,26 @@
 # upgrade_docker
 
-Script Bash de mise à jour des images Docker d'un hôte : il parcourt les stacks Compose et
-les conteneurs standalone, ne télécharge que ce qui a réellement changé, et relance
-uniquement ce qui doit l'être.
-
-Écrit pour tourner sans surveillance (cron, `--notify`), mais **à lire avant de l'automatiser** :
-la section [Pièges et limites connues](#pièges-et-limites-connues) décrit des comportements
-qui peuvent surprendre, dont certains ont déjà causé une interruption de service.
+Script Bash de mise à jour des conteneurs Docker **qui tournent** : stacks Compose
+(y compris celles déployées par Portainer) et conteneurs standalone. Il ne télécharge
+que ce qui a réellement changé, et ne relance que ce qui doit l'être.
 
 ## Le contrat
 
-C'est toute la logique du script, en une table :
-
 | Situation | Ce que fait le script |
 |---|---|
-| Image tirée d'un registry, **pas de mise à jour** | Rien. Le conteneur n'est pas touché. |
-| Image tirée d'un registry, **mise à jour dispo** | Pull, puis recréation du conteneur à l'identique. |
-| Service Compose `build:`, **image de base à jour** | Rien. Aucune reconstruction. |
-| Service Compose `build:`, **base périmée** | Pull de la base, `docker compose build`, puis `up -d`. |
-| Image construite localement, absente de tout registry | Ignorée (`[LOCAL]`), jamais comptée en échec. |
+| Image à jour | Rien. Le conteneur n'est pas touché. |
+| Image d'un registry, mise à jour dispo | Pull, puis `up -d` de la stack. |
+| Service Compose `build:`, base à jour | Rien. Aucune reconstruction. |
+| Service Compose `build:`, base (`FROM`) périmée | Pull de la base, `docker compose build`, `up -d`. |
+| Image construite localement, absente du registry | Ignorée, jamais comptée en échec. |
+| Conteneur standalone, mise à jour dispo | Pull + signalement `[À RECRÉER]`. **Pas de recréation.** |
+| Stack ou conteneur à l'arrêt | Invisible pour le script : il ne voit que ce qui tourne. |
 
-Autrement dit : **rien ne bouge tant que rien n'a changé en amont.**
+Autrement dit : **rien ne bouge tant que rien n'a changé en amont**, et ce qui est
+éteint reste éteint.
 
-> ⚠️ Le script met à jour des **images**. Il ne redéploie pas tes modifications de code local :
-> pour ça, c'est `docker compose up -d --build`.
+> ⚠️ Le script met à jour des **images**. Il ne redéploie pas tes modifications de code
+> local : pour ça, c'est `docker compose up -d --build`.
 
 ## Installation
 
@@ -35,21 +32,13 @@ sudo chmod +x /usr/local/bin/upgrade_docker
 ## Utilisation
 
 ```bash
-# Voir ce qui serait fait, sans rien modifier
-sudo upgrade_docker --dry-run
+sudo upgrade_docker --dry-run                     # voir ce qui serait fait
+sudo upgrade_docker                               # mettre à jour
 
-# Mettre à jour
-sudo upgrade_docker
-
-# Cas courants
 sudo upgrade_docker --image nginx:latest          # une seule image
-sudo upgrade_docker --exclude redis:7             # tout sauf celle-ci
-sudo upgrade_docker --exclude-dir BACKUP          # ignorer les dossiers BACKUP/
-sudo upgrade_docker --no-prune                    # garder les anciennes images
-sudo upgrade_docker --compose-only                # seulement les stacks
-sudo upgrade_docker --standalone-only             # seulement les conteneurs standalone
+sudo upgrade_docker --exclude plex                # tout sauf cette stack / ce conteneur
 sudo upgrade_docker --no-build                    # ne rien reconstruire
-sudo upgrade_docker --force-reboot                # recréer même sans changement de digest
+sudo upgrade_docker --force-reboot                # recréer les stacks même sans changement
 sudo upgrade_docker --notify admin@example.com    # mail si échec
 ```
 
@@ -57,188 +46,83 @@ sudo upgrade_docker --notify admin@example.com    # mail si échec
 
 | Option | Description | Défaut |
 |---|---|---|
-| `--dry-run` | Vérifie les mises à jour sans rien modifier | - |
-| `--parallel N` | Jobs simultanés | 20 |
-| `--timeout N` | Timeout en secondes par pull | 300 |
-| `--health-wait N` | Secondes d'observation d'un conteneur standalone recréé avant de supprimer l'ancien. `0` désactive la vérification | 5 |
-| `--search-dir DIR` | Répertoire à scanner (répétable) | `/opt /home /docker_data` |
-| `--exclude-dir NOM` | **Nom** de dossier à ignorer au scan (répétable) — s'ajoute à `vendor`, `node_modules`, `html/apps`, `.git`, `OLD`. Voir le piège plus bas | - |
-| `--no-prune` | Ne pas supprimer les images obsolètes (`docker image prune -f`) | - |
-| `--no-build` | Ne pas reconstruire les services Compose avec `build:` | - |
-| `--compose-only` | Traite uniquement les stacks Compose | - |
-| `--standalone-only` | Traite uniquement les images standalone | - |
-| `--force` | Traite aussi les images déjà à jour — effet visible en `--dry-run` (signalées `[FORCE]`) ; en mode normal toutes les images sont déjà pullées | - |
-| `--force-reboot` | Recrée les conteneurs même si le digest n'a pas changé | - |
-| `--exclude IMAGE` | Exclut une image (répétable) | - |
-| `--image IMAGE` | Traite uniquement cette image | - |
-| `--notify EMAIL` | Envoie un mail **en cas d'échec uniquement** (nécessite `mail`) | - |
+| `--dry-run` | Liste les mises à jour disponibles, ne touche à rien | - |
+| `--image IMAGE` | Ne traite que les stacks/conteneurs qui utilisent cette image | - |
+| `--exclude NOM` | Ignore une stack, un conteneur ou une image (répétable) | - |
+| `--compose-only` | Stacks Compose uniquement | - |
+| `--standalone-only` | Conteneurs standalone uniquement | - |
+| `--no-build` | Ne reconstruit pas les services `build:` (même si leur base a bougé) | - |
+| `--force-reboot` | Recrée les stacks même sans nouvelle image (`up -d --force-recreate`) | - |
+| `--no-prune` | Garde les images obsolètes | - |
+| `--timeout N` | Timeout d'un pull, en secondes, par stack ou image | 600 |
 | `--log FILE` | Fichier de log | `/var/log/docker-update.log` |
-
-## Configuration (optionnelle)
-
-Pour figer ses propres défauts sans retaper d'options, créer `/etc/upgrade_docker.conf`
-(système) ou `~/.config/upgrade_docker.conf` (utilisateur) :
-
-```bash
-# Stacks à ne jamais scanner (archives, doublons, clones de repo d'ops…)
-EXCLUDE_DIRS=(vieille-stack mon-repo-ops)
-
-# Autres défauts possibles
-SEARCH_DIRS=(/opt /srv)
-PARALLEL=10
-NOTIFY_EMAIL=admin@exemple.fr
-LOG_FILE=/var/log/docker-update.log
-HEALTH_WAIT=5
-```
-
-Les options passées en **ligne de commande priment** sur ce fichier.
+| `--notify EMAIL` | Mail **en cas d'échec uniquement** (nécessite `mail`) | - |
 
 ## Fonctionnement
 
-### Stacks Docker Compose
+### Découverte par les conteneurs qui tournent
 
-- Scanne les répertoires configurés à la recherche de `docker-compose.yml` / `docker-compose.yaml`
-- **Services avec `build:`** : le script lit les `FROM` du Dockerfile, vérifie si l'image de base
-  a une mise à jour, et **ne reconstruit que dans ce cas** (base pullée, puis `docker compose build`).
-  Sans ça, une image construite localement ne serait jamais mise à jour et sa base vieillirait
-  indéfiniment. Désactivable avec `--no-build`.
-  > La base est pullée **explicitement**, car `build --pull` ne rafraîchit pas le tag local :
-  > la base serait alors vue comme périmée à chaque exécution, et reconstruite pour rien.
-- Puis `docker compose pull`. Le drapeau `--ignore-buildable` est ajouté **s'il est supporté**
-  par la version de Compose installée : sans lui, `pull` sort en erreur sur les services
-  `build:` et la stack entière serait comptée en échec
-- `docker compose up -d --remove-orphans` n'est lancé **que si une image a réellement changé**
-  (pullée ou reconstruite), ou avec `--force-reboot`. Sinon la stack est laissée en l'état :
-  `[OK] Rien de nouveau`.
-  > Lancer `up -d` à chaque passage n'est pas neutre : il démarre une stack volontairement
-  > éteinte, applique une dérive de config jamais déployée, et surtout Compose **recrée
-  > systématiquement** les services en `network_mode: service:X` — soit un redémarrage à chaque
-  > exécution, pour rien. C'est un comportement de Compose (reproductible à la main, sans ce
-  > script), mais un `up -d` inconditionnel le déclenchait à tous les coups.
-- Avec `--force-reboot` : `docker compose up -d --force-recreate`
+Pas de scan de répertoires : les stacks sont découvertes via les labels
+`com.docker.compose.*` des conteneurs en cours d'exécution, qui donnent le projet,
+ses fichiers compose et ses fichiers d'env. Conséquences :
 
-### Images standalone
+- une stack **éteinte n'est jamais démarrée** ni même vue ;
+- pas de piège du vieux clone oublié : seul le compose réellement déployé compte ;
+- les stacks **Portainer** sont gérées : leurs labels pointent vers `/data/compose/N`
+  (chemin vu depuis le conteneur Portainer), le script les traduit via le mountpoint
+  du volume `portainer_data`. C'est pour ça qu'il faut être **root**.
 
-- Liste les images hors stacks Compose, pull parallèle avec `xargs -P`
-- Les conteneurs concernés sont repérés **avant** le pull : après, le tag pointe déjà sur la
-  nouvelle image et `--filter ancestor=` ne les retrouverait plus
-- Si le digest change (ou avec `--force-reboot`), le conteneur est **recréé à l'identique**
-  depuis son `docker inspect` : labels (Traefik…), ports, volumes (binds **et** volumes nommés),
-  variables d'env, réseau (y compris `network_mode: container:xxx`), limites RAM/CPU/pids,
-  devices, capabilities, DNS, log driver, user, workdir, commande et entrypoint
-- **Bascule sécurisée** : l'ancien conteneur est *renommé*, puis supprimé seulement si le
-  nouveau **démarre et survit** à `--health-wait` secondes d'observation (encore `running`,
-  aucun redémarrage). Dans tous les autres cas — `docker run` en échec, ou conteneur qui
-  démarre puis meurt — **rollback automatique** : l'ancien est restauré sous son nom et
-  redémarré, et l'image fautive n'est pas adoptée
-- Env et labels ne sont réinjectés que s'ils **diffèrent de l'image** : réinjecter ses défauts
-  figerait l'ancienne version et annulerait la mise à jour
-- Une image absente de tout registry est **ignorée**, pas comptée en échec — même verdict que
-  le `--dry-run`. Un `RepoDigest` ne suffit pas à trancher (Compose en pose un sur les images
-  qu'il construit) : seul le registry fait foi
+### Services `build:`
 
-### Dry-run
+Le script lit les `FROM` du Dockerfile (stages multi-étapes, `FROM $ARG` et `scratch`
+ignorés) et vérifie si l'image de **base** a une mise à jour. Seulement dans ce cas :
+pull explicite de la base, `docker compose build`, puis `up -d`. Sans ça, une image
+construite localement vieillirait indéfiniment.
 
-- Interroge l'API registry (aucun pull) pour comparer les digests
-- Registries gérés : Docker Hub, GHCR, LSCR (alias de GHCR) et **tout registry conforme** — le
-  jeton est obtenu en lisant le défi `www-authenticate`. Les registries privés **avec un port**
-  (`registry.local:5000/app`) sont correctement analysés, de même que les dépôts publics servis
-  en anonyme (sans jeton)
-- Calcule la taille réelle des layers à télécharger et estime l'espace libéré après prune
-- Pour les services `build:` : lit les `FROM` et vérifie l'**image de base** (les stages
-  multi-étapes, `FROM $ARG` et `scratch` sont ignorés)
-- Étiquettes : `[OK]` à jour · `[UPDATE]` mise à jour disponible · `[FORCE]` forcé mais déjà à
-  jour · `[LOCAL]` image locale · `[BUILD]` service construit localement (base vérifiée)
+### `up -d` seulement si nécessaire
 
-Le dry-run et le run réel donnent **le même verdict sur les mêmes images** : ce qui est annoncé
-`[LOCAL]` est bien ignoré, ce qui est annoncé `[UPDATE]` est bien mis à jour.
+`docker compose up -d` n'est lancé que si un conteneur tourne sur une image plus
+vieille que celle que porte son tag (ou avec `--force-reboot`). Un `up -d`
+inconditionnel n'est pas neutre : Compose recrée systématiquement les services en
+`network_mode: service:X`, soit un redémarrage pour rien à chaque passage.
+
+### Standalone : pull, pas de recréation
+
+Les conteneurs hors Compose sont pullés, puis **signalés** `[À RECRÉER]` : la
+recréation reste manuelle. Un `docker run` reconstruit depuis l'inspect perd toujours
+un réglage (alias réseau, ulimits, GPU…) ; la bonne réponse est de passer le conteneur
+en stack Compose, qui elle est entièrement automatisée.
+
+### Vérification des mises à jour
+
+`docker buildx imagetools inspect` compare le digest du registry aux `RepoDigests`
+locaux, avec les identifiants docker configurés. Résultat mis en cache par image :
+Docker Hub répond 429 quand on l'interroge trop (bases partagées entre services).
+Une image absente du registry est considérée comme buildée localement et ignorée en
+silence.
 
 ### Code de sortie
 
 | Code | Signification |
 |---|---|
 | `0` | Aucun échec (y compris s'il n'y avait rien à faire) |
-| `1` | Au moins une image en échec — c'est aussi ce qui déclenche `--notify` |
-
-## Pièges et limites connues
-
-### ⚠️ Une stack éteinte peut être démarrée — si elle a une mise à jour
-
-`docker compose up -d` n'est lancé **que si quelque chose a bougé** (image pullée ou
-reconstruite), ou avec `--force-reboot`. Une stack éteinte dont rien n'a changé est donc
-laissée tranquille.
-
-Mais si l'une de ses images a une mise à jour, `up -d` s'exécute — et **démarre la stack**. Le
-script ne fait aucune différence entre « éteinte parce que cassée » et « éteinte parce que je
-l'ai voulu ».
-
-Pour qu'une stack reste à l'arrêt quoi qu'il arrive : la déplacer dans un `OLD/` (exclu par
-défaut) ou l'ajouter à `EXCLUDE_DIRS`.
-
-### ⚠️ Deux dossiers de même nom = un seul projet Compose
-
-Compose nomme un projet d'après le **nom du dossier**. Deux copies d'une stack dans
-`/docker_data/monsite` et `/home/user/monsite` sont donc **le même projet `monsite`** : le
-script les scanne toutes les deux, et la seconde `up -d` écrase le déploiement de la première.
-
-C'est arrivé en vrai : un vieux clone oublié a repris la main sur un site en production et l'a
-mis en boucle de crash pendant deux heures, avec une configuration périmée de deux mois.
-
-Et **`--exclude-dir` ne sauve pas** de ce cas : il filtre sur le **nom** du dossier, pas sur le
-chemin. `--exclude-dir monsite` exclurait les deux. La seule vraie réponse est de supprimer ou
-de déplacer le doublon.
-
-### Conteneurs qui sortent vite volontairement
-
-Après avoir recréé un conteneur standalone, le script l'**observe pendant `--health-wait`
-secondes** (5 par défaut) avant de supprimer l'ancien. Il n'est validé que s'il est encore
-`running` et n'a **redémarré aucune fois** ; sinon, rollback.
-
-C'est nécessaire parce qu'un `docker run` réussi ne prouve rien : il rend 0 dès que le
-conteneur *démarre*. Une image qui casse l'application passe ce test, puis meurt et boucle sur
-sa `restart policy` — l'ancien conteneur aurait alors été supprimé pour rien. Le critère fiable
-est `RestartCount`, car un conteneur en boucle de crash repasse brièvement par `running` mais
-ne peut pas cacher ses redémarrages.
-
-La contrepartie : un conteneur dont le **travail se termine légitimement** pendant la fenêtre
-d'observation (job one-shot, batch qui finit) est vu comme mort et déclenche un rollback à
-tort. Le script ne recrée que des conteneurs qui *tournaient*, ce qui rend le cas rare — mais
-si ça te concerne, `--health-wait 0` désactive la vérification et rétablit l'ancien
-comportement.
-
-Coût : `--health-wait` secondes par conteneur **effectivement recréé**, et rien du tout quand
-il n'y a pas de mise à jour.
-
-### Recréation standalone : ce qui n'est pas reproduit
-
-La recréation reconstruit un `docker run` à partir de l'inspect. Quelques réglages ne sont pas
-repris — le script **prévient explicitement** quand il en détecte :
-
-- `ulimits`, `sysctls`, réservations **GPU**
-- **alias réseau** et **IP statiques**
-- entrypoint personnalisé **multi-arguments**
-
-Pour ces cas, et de manière générale, une **stack Compose** reste préférable : le chemin Compose
-reproduit tout fidèlement.
-
-### Bon à savoir
-
-- Une image sans conteneur (orpheline) est quand même pullée si elle a une mise à jour. Elle
-  apparaît en `[UPDATE] … (aucun conteneur actif)` : utile pour repérer ce qui traîne.
-- Un conteneur **arrêté** n'est jamais recréé : seuls les conteneurs en cours sont concernés
-  (`--filter ancestor=` ne liste que ceux qui tournent). Son image, elle, sera pullée.
-- Le dry-run fait une requête de manifest par image ; Docker Hub compte ces requêtes dans ses
-  quotas anonymes (100 / 6 h par IP).
+| `1` | Au moins un échec, c'est aussi ce qui déclenche `--notify` |
 
 ## Prérequis
 
-- `docker` + plugin `compose`
-- `jq`, `xargs`, `curl`
-- Bash ≥ 4.3 (namerefs)
-- Root, ou accès au socket Docker
+- `docker` + plugins `compose` et `buildx`
+- `jq`, `awk`
+- Bash ≥ 4
+- Root (volume Portainer illisible sinon), ou accès au socket Docker si pas de Portainer
 
 ## Logs
 
-Fichier : `/var/log/docker-update.log` (modifiable via `--log` ou `LOG_FILE`).
-Rotation automatique au-delà de **5 Mo** : le fichier est horodaté en `.bak`, et les `.bak` de
-plus de **30 jours** sont supprimés.
+Fichier : `/var/log/docker-update.log` (modifiable via `--log`), sortie dupliquée
+sur le terminal.
+
+## Historique
+
+Cette version est une réécriture complète (168 lignes). La précédente (~1100 lignes :
+scan de répertoires, recréation automatique des standalone avec rollback, dry-run par
+API registry, fichier de configuration) reste disponible dans l'historique git si l'un
+de ces comportements te manque.
