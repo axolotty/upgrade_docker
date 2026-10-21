@@ -105,6 +105,12 @@ bases_updated() {
 
 log "=== Démarrage$($DRY_RUN && echo ' [DRY-RUN]') ==="
 
+# Signale si une version différente du script est publiée sur GitHub (pas de mise à jour auto)
+SELF_RAW=https://raw.githubusercontent.com/axolotty/upgrade_docker/master/upgrade_docker
+if remote=$(curl -fsSL --max-time 10 "$SELF_RAW" 2>/dev/null); then
+    [[ $remote == "$(<"$0")" ]] || log "[SCRIPT] version différente publiée sur GitHub : $SELF_RAW"
+fi
+
 # --- Stacks Compose : découvertes via les labels des conteneurs qui tournent ---
 $COMPOSE && while IFS='|' read -r -u3 proj files envs; do
     mapfile -t ids < <(docker ps -q --filter "label=com.docker.compose.project=$proj")

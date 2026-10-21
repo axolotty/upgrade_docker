@@ -93,6 +93,13 @@ recréation reste manuelle. Un `docker run` reconstruit depuis l'inspect perd to
 un réglage (alias réseau, ulimits, GPU…) ; la bonne réponse est de passer le conteneur
 en stack Compose, qui elle est entièrement automatisée.
 
+### Auto-vérification du script
+
+Au lancement, le script compare sa propre copie avec la version publiée sur ce dépôt
+(branche `master`). S'il diffère, il logue `[SCRIPT] version différente publiée sur
+GitHub` et **continue** : pas de mise à jour automatique, pas de blocage si GitHub est
+injoignable.
+
 ### Vérification des mises à jour
 
 `docker buildx imagetools inspect` compare le digest du registry aux `RepoDigests`
@@ -111,7 +118,7 @@ silence.
 ## Prérequis
 
 - `docker` + plugins `compose` et `buildx`
-- `jq`, `awk`
+- `jq`, `awk`, `curl`
 - Bash ≥ 4
 - Root (volume Portainer illisible sinon), ou accès au socket Docker si pas de Portainer
 
