@@ -150,6 +150,23 @@ $COMPOSE && while IFS='|' read -r -u3 proj files envs; do
 done 3< <(docker ps --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.config_files"}}|{{.Label "com.docker.compose.project.environment_file"}}' \
           | awk -F'|' '$1 != ""' | sort -u)
 
+# --- Orphelins réseau : un service en network_mode container:X meurt quand X est recréé
+# (Docker fige l'ID de X à la création) et sa stack, arrêtée, échappe à la boucle ci-dessus.
+# Exemple : la stack arr sur gluetun-proxy-proton (incident du 22 oct 2026).
+$COMPOSE && while IFS='|' read -r -u3 id proj files envs; do
+    nm=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$id" 2>/dev/null)
+    [[ $nm == container:* && -n $proj && -n $files ]] || continue
+    docker inspect "${nm#container:}" >/dev/null 2>&1 && continue
+    excluded "$proj" && continue
+    name=$(docker inspect -f '{{.Name}}' "$id")
+    $DRY_RUN && { log "[ORPHELIN] $proj : ${name#/} accroché à un namespace disparu, serait recréé"; continue; }
+    log "[ORPHELIN] $proj : ${name#/} accroché à un namespace disparu, recréation de la stack"
+    args=(-p "$proj")
+    IFS=, read -ra f <<<"$files"; for x in "${f[@]}"; do args+=(-f "$(host_path "$x")"); done
+    IFS=, read -ra f <<<"$envs";  for x in "${f[@]}"; do args+=(--env-file "$(host_path "$x")"); done
+    docker compose "${args[@]}" up -d --force-recreate || FAILED+=("orphelin:$proj")
+done 3< <(docker ps -a --filter status=exited --format '{{.ID}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.config_files"}}|{{.Label "com.docker.compose.project.environment_file"}}')
+
 # --- Standalone : pull + signalement. Pas de recréation : un `docker run` reconstruit
 # depuis l'inspect perd toujours un réglage. Mettez-les en Compose pour l'automatiser.
 # ponytail: Portainer est le seul concerné ici ; recréation auto si ça se multiplie.
